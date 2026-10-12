@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://goshi.app
+    about: Do not open a public issue. Write to support@goshi.app with SECURITY in the subject.

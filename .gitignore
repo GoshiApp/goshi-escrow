@@ -1,0 +1,13 @@
+target
+node_modules
+.anchor
+test-ledger
+.DS_Store
+.shim
+.test-wallet.json
+.devnet-wallet.json
+.devnet-*.json
+.mainnet-*.json
+.v1-program-keypair.json
+.v2-program-keypair.json
+.mainnet-rpc.txt

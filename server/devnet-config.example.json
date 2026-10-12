@@ -1,0 +1,15 @@
+{
+  "version": 4,
+  "native": true,
+  "requiredSaboteurs": 3,
+  "cluster": "devnet",
+  "programId": "7phmG6f5A7g2GB2xMSV1TzCTDJMLMNf8WsBcwWgC4ggE",
+  "authority": "64uZbYidk2w8pU9tHhkEJBcv4KGnCR36DBVXAAtSJrYS",
+  "goshiMint": "DiAQBixUdJxCNUdY3NyogaBXScgMiCWPeireAtHEHRC8",
+  "config": "AL3iUu8Qkav7wx37XqdXNswZ1kM46vPmMwmnZdWWd11Q",
+  "vault": "23qvGQBcKokBXyeS5fLaq4G4ADNddAxEQg4APgnSXqYF",
+  "infraWallet": "JD6zGCtMiwRL6UMuP5a7FN465XDCCuhWzHjU8cQAMQHR",
+  "liquidityWallet": "CCQnx7EsybugJQvGj2ky9GBRF2eebXXtVeC8zhAiufkt",
+  "minHolder": "100000000",
+  "initializeTx": "wyiYsJLdmhwdvDQmKbjK7jhs9XquhA68b3wjM1d4GxUkSoJ5TGnwuD257BZmw7moyT51YejEK9Kr3P1RNhbADxR"
+}

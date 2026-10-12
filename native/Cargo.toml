@@ -1,0 +1,24 @@
+[package]
+name = "goshi-escrow-native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Goshi escrow, native (no framework) version: small enough to deploy with a fraction of a SOL"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "goshi_escrow_native"
+
+[dependencies]
+pinocchio = "0.8"
+pinocchio-system = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = false
+
+[workspace]

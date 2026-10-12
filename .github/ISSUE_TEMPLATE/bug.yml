@@ -1,0 +1,15 @@
+name: Bug
+description: Something does not work
+labels: ["bug"]
+body:
+  - type: textarea
+    id: steps
+    attributes: { label: Steps to reproduce }
+    validations: { required: true }
+  - type: textarea
+    id: expected
+    attributes: { label: Expected and actual behavior }
+    validations: { required: true }
+  - type: input
+    id: env
+    attributes: { label: Browser, wallet and network (devnet or mainnet) }

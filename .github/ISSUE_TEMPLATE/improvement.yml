@@ -1,0 +1,11 @@
+name: Improvement
+description: Suggest an improvement to the game, the site or the code
+labels: ["improvement"]
+body:
+  - type: textarea
+    id: what
+    attributes: { label: What should change }
+    validations: { required: true }
+  - type: textarea
+    id: why
+    attributes: { label: Why it helps players or contributors }
