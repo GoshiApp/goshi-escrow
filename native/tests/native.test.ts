@@ -12,7 +12,8 @@ import { GoshiEscrow, decodeConfig, decodeRoom, decodeVault, ERRORS } from "../c
 const SOL = BigInt(LAMPORTS_PER_SOL);
 const pct = (a: bigint, p: bigint) => (a * p) / 100n;
 const here = path.dirname(new URL(import.meta.url).pathname);
-const so = path.resolve(here, "../target/deploy/goshi_escrow_native.so");
+// The tests of the refund timeout need the build made with `--features short-refund` (4 seconds instead of 3 hours).
+const so = path.resolve(here, process.env.SO ?? "../target/test-deploy/goshi_escrow_native.so");
 const programKey = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(path.resolve(here, "../target/deploy/goshi_escrow_native-keypair.json"), "utf8"))));
 const PORT = 18899;
 const conn = new Connection(`http://127.0.0.1:${PORT}`, "confirmed");
@@ -20,6 +21,7 @@ const g = new GoshiEscrow(programKey.publicKey);
 
 let validator: ChildProcess;
 const authority = Keypair.generate();
+const guardian = Keypair.generate();
 const infra = Keypair.generate();
 const liquidity = Keypair.generate();
 const outsider = Keypair.generate();
@@ -79,7 +81,7 @@ before(async () => {
       await new Promise((r) => setTimeout(r, 1000));
     }
   }
-  for (const k of [authority, infra, liquidity, outsider, passHolder]) await fund(k.publicKey, 20);
+  for (const k of [authority, guardian, infra, liquidity, outsider, passHolder]) await fund(k.publicKey, 20);
   mint = await createMint(conn, authority, authority.publicKey, null, 6);
   for (let i = 0; i < 10; i++) {
     const k = Keypair.generate();
@@ -101,16 +103,30 @@ after(() => {
 });
 
 describe("goshi-escrow native", () => {
-  test("initializes once and rejects a second initialization", async () => {
-    await run([g.initialize(authority.publicKey, infra.publicKey, liquidity.publicKey, mint, MIN_HOLD, 3)], [authority]);
+  test("initializes once, even when somebody sent lamports to its addresses first, and rejects a second initialization", async () => {
+    // Anybody can send lamports to a PDA address before it exists. That must not be able to block the initialization.
+    await run([SystemProgram.transfer({ fromPubkey: outsider.publicKey, toPubkey: g.pda.config, lamports: 5_000_000 })], [outsider]);
+    await run([SystemProgram.transfer({ fromPubkey: outsider.publicKey, toPubkey: g.pda.vault, lamports: 1_000_000 })], [outsider]);
+    await run([g.initialize(authority.publicKey, infra.publicKey, liquidity.publicKey, mint, MIN_HOLD, 3, guardian.publicKey)], [authority]);
     const cfg = decodeConfig((await conn.getAccountInfo(g.pda.config))!.data)!;
     assert.equal(cfg.authority.toBase58(), authority.publicKey.toBase58());
+    assert.equal(cfg.guardian.toBase58(), guardian.publicKey.toBase58());
     assert.equal(cfg.requiredSaboteurs, 3);
     assert.equal(cfg.minHolder, MIN_HOLD);
     await expectCode(
       run([g.initialize(authority.publicKey, infra.publicKey, liquidity.publicKey, mint, MIN_HOLD, 3)], [authority]),
       "AlreadyInitialized"
     );
+  });
+
+  test("a room address that already holds lamports can still be created", async () => {
+    const id = nextRoom++;
+    await run([SystemProgram.transfer({ fromPubkey: outsider.publicKey, toPubkey: room(id), lamports: 1_000_000 })], [outsider]);
+    await run([g.createRoom(authority.publicKey, id, SOL)], [authority]);
+    const r = await getRoom(id);
+    assert.ok(r && r.entryFee === SOL && r.state === "waiting");
+    assert.ok(r!.createdAt > 0n);
+    await run([g.cancelRoom(authority.publicKey, id, [])], [authority]);
   });
 
   test("only the authority creates rooms", async () => {
@@ -215,7 +231,7 @@ describe("goshi-escrow native", () => {
     assert.equal(r.passes, 1);
     assert.equal(r.state, "active");
     const held = await bal(room(id));
-    const rent = BigInt(await conn.getMinimumBalanceForRentExemption(471));
+    const rent = BigInt(await conn.getMinimumBalanceForRentExemption(487));
     assert.equal(held - rent, 9n * fee, "only nine entries are inside");
 
     const podium = [passHolder.publicKey, paid[2].publicKey, paid[5].publicKey];
@@ -239,8 +255,9 @@ describe("goshi-escrow native", () => {
     assert.equal(await getRoom(cid), null);
   });
 
-  test("the authority can lower the required saboteurs and a room starts without them", async () => {
-    await run([g.setRequiredSaboteurs(authority.publicKey, 0)], [authority]);
+  test("the guardian can lower the required saboteurs and a room starts without them", async () => {
+    await expectCode(run([g.setRequiredSaboteurs(authority.publicKey, 0)], [authority]), "Unauthorized");
+    await run([g.setRequiredSaboteurs(guardian.publicKey, 0)], [guardian]);
     const id = await newRoom(SOL);
     for (let i = 0; i < 10; i++) await run([g.joinRoom(paid[i].publicKey, id)], [paid[i]]);
     assert.equal((await getRoom(id))!.state, "active");
@@ -248,7 +265,7 @@ describe("goshi-escrow native", () => {
     await run([g.finalizeRoyale(authority.publicKey, id, infra.publicKey, liquidity.publicKey, paid.slice(0, 3).map((k) => k.publicKey), [])], [authority]);
     const rake = 10n * SOL - pct(10n * SOL, 88n);
     assert.equal((await bal(infra.publicKey)) - infraBefore, pct(rake, 15n));
-    await run([g.setRequiredSaboteurs(authority.publicKey, 3)], [authority]);
+    await run([g.setRequiredSaboteurs(guardian.publicKey, 3)], [guardian]);
   });
 
   test("VS: losers keep 80% of the net entry, the winner takes the rest", async () => {
@@ -307,18 +324,105 @@ describe("goshi-escrow native", () => {
     assert.equal(await getRoom(id), null);
   });
 
-  test("the authority and the wallets can be rotated, and only with the right signatures", async () => {
+  test("a stolen hot key cannot touch the wallets, the settings, the vault or the roles; the guardian can replace it", async () => {
     const next = Keypair.generate();
     const newInfra = Keypair.generate().publicKey;
-    // A stranger cannot change anything.
+    const dest = Keypair.generate();
+    await fund(dest.publicKey, 1);
+    // Not a stranger, and not the authority either: the house wallets and the roles belong to the guardian.
     await expectCode(run([g.setWallets(paid[0].publicKey, newInfra, liquidity.publicKey)], [paid[0]]), "Unauthorized");
-    await run([g.setWallets(authority.publicKey, newInfra, liquidity.publicKey)], [authority]);
+    await expectCode(run([g.setWallets(authority.publicKey, newInfra, liquidity.publicKey)], [authority]), "Unauthorized");
+    await expectCode(run([g.setMinHolder(authority.publicKey, 1n)], [authority]), "Unauthorized");
+    await expectCode(run([g.withdrawVault(authority.publicKey, dest.publicKey, 1n)], [authority]), "Unauthorized");
+    await expectCode(run([g.setAuthority(authority.publicKey, outsider.publicKey)], [authority, outsider]), "Unauthorized");
+    await expectCode(run([g.setGuardian(authority.publicKey, outsider.publicKey)], [authority, outsider]), "Unauthorized");
+    // The guardian changes the wallets and puts them back.
+    await run([g.setWallets(guardian.publicKey, newInfra, liquidity.publicKey)], [guardian]);
     assert.equal(decodeConfig((await conn.getAccountInfo(g.pda.config))!.data)!.infraWallet.toBase58(), newInfra.toBase58());
-    await run([g.setWallets(authority.publicKey, infra.publicKey, liquidity.publicKey)], [authority]);
-    await run([g.setAuthority(authority.publicKey, next.publicKey)], [authority, next]);
-    // The old authority is out; the new one can hand it back.
-    await expectCode(run([g.setWallets(authority.publicKey, infra.publicKey, liquidity.publicKey)], [authority]), "Unauthorized");
-    await run([g.setAuthority(next.publicKey, authority.publicKey)], [authority, next]);
+    await run([g.setWallets(guardian.publicKey, infra.publicKey, liquidity.publicKey)], [guardian]);
+    // The new authority signs too (no typos), the old one does not: a lost hot key is replaced without its help.
+    await run([g.setAuthority(guardian.publicKey, next.publicKey)], [guardian, next]);
+    await expectCode(run([g.createRoom(authority.publicKey, nextRoom++, SOL)], [authority]), "Unauthorized");
+    await run([g.createRoom(next.publicKey, nextRoom++, SOL)], [authority, next]).catch(() => undefined);
+    await run([g.setAuthority(guardian.publicKey, authority.publicKey)], [guardian, authority]);
+    // The guardian role itself moves only with both keys (the new one signs too).
+    const guard2 = Keypair.generate();
+    await run([g.setGuardian(guardian.publicKey, guard2.publicKey)], [guardian, guard2]);
+    await expectCode(run([g.setWallets(guardian.publicKey, infra.publicKey, liquidity.publicKey)], [guardian]), "Unauthorized");
+    await run([g.setGuardian(guard2.publicKey, guardian.publicKey)], [guardian, guard2]);
+  });
+
+  test("a payout that would leave a wallet below the rent minimum goes to the vault instead of blocking the settlement", async () => {
+    await run([g.setRequiredSaboteurs(guardian.publicKey, 3)], [guardian]);
+    const fee = 6_000_000n; // a 1 USD room: a saboteur's share is 400,000 lamports, under the 890,880 of the rent minimum
+    const id = await newRoom(fee);
+    for (let i = 0; i < 10; i++) await run([g.joinRoom(paid[i].publicKey, id)], [paid[i]]);
+    // Three saboteurs; the first one empties its wallet after taking the seat (anybody else pays the transaction fees).
+    const sabs: Keypair[] = [];
+    for (let i = 0; i < 3; i++) {
+      const k = Keypair.generate();
+      await fund(k.publicKey, 1);
+      const ata = await createAccount(conn, authority, mint, k.publicKey, Keypair.generate());
+      await mintTo(conn, authority, mint, ata, authority, 500_000_000n);
+      await run([g.joinFree(k.publicKey, id, ata)], [authority, k]);
+      sabs.push(k);
+    }
+    const left = await conn.getBalance(sabs[0].publicKey);
+    await run([SystemProgram.transfer({ fromPubkey: sabs[0].publicKey, toPubkey: outsider.publicKey, lamports: left })], [authority, sabs[0]]);
+    assert.equal(await bal(sabs[0].publicKey), 0n);
+    const podium = paid.slice(0, 3).map((k) => k.publicKey);
+    const v0 = decodeVault((await conn.getAccountInfo(g.pda.vault))!.data)!;
+    const b1 = await bal(sabs[1].publicKey);
+    await run([g.finalizeRoyale(authority.publicKey, id, infra.publicKey, liquidity.publicKey, podium, sabs.map((k) => k.publicKey))], [authority]);
+    const each = pct(10n * fee, 2n) / 3n;
+    assert.equal(await bal(sabs[0].publicKey), 0n, "the empty wallet got nothing");
+    assert.equal((await bal(sabs[1].publicKey)) - b1, each, "the others were paid");
+    assert.equal(await getRoom(id), null, "and the room settled");
+    // The share that could not be paid is in the super pot.
+    const nominal = 10n * fee;
+    const pool = pct(nominal, 88n);
+    const rake = nominal - pool - each * 3n;
+    const jackpot = rake - pct(rake, 10n) - pct(rake, 15n) - pct(rake, 25n);
+    const v1 = decodeVault((await conn.getAccountInfo(g.pda.vault))!.data)!;
+    assert.equal(v1.openJackpot - v0.openJackpot, jackpot + each);
+  });
+
+  test("anybody can refund an expired room; before the timeout nobody can", async () => {
+    const id = await newRoom(SOL);
+    for (let i = 0; i < 4; i++) await run([g.joinRoom(paid[i].publicKey, id)], [paid[i]]);
+    const refunds = paid.slice(0, 4).map((k) => k.publicKey);
+    await expectCode(run([g.refundExpired(outsider.publicKey, id, authority.publicKey, refunds)], [outsider]), "TooEarly");
+    await new Promise((r) => setTimeout(r, 6000));
+    const before = await Promise.all(refunds.map(bal));
+    // Not to somebody else's address: the rent goes back to the authority and the refunds to the payers, in order.
+    await expectCode(run([g.refundExpired(outsider.publicKey, id, outsider.publicKey, refunds)], [outsider]), "WrongAccount");
+    await expectCode(run([g.refundExpired(outsider.publicKey, id, authority.publicKey, [...refunds].reverse())], [outsider]), "WrongAccount");
+    const authBefore = await bal(authority.publicKey);
+    await run([g.refundExpired(outsider.publicKey, id, authority.publicKey, refunds)], [outsider]);
+    for (let i = 0; i < 4; i++) assert.equal((await bal(refunds[i])) - before[i], SOL);
+    assert.ok((await bal(authority.publicKey)) > authBefore, "the rent came back to the authority");
+    assert.equal(await getRoom(id), null);
+  });
+
+  test("the room records the slot in which it became active and the proof log carries it", async () => {
+    const id = await newRoom(SOL);
+    for (let i = 0; i < 9; i++) await run([g.joinRoom(paid[i].publicKey, id)], [paid[i]]);
+    assert.equal((await getRoom(id))!.activeSlot, 0n, "still waiting");
+    await run([g.setRequiredSaboteurs(guardian.publicKey, 0)], [guardian]);
+    const sig = await run([g.joinRoom(paid[9].publicKey, id)], [paid[9]]);
+    const r = (await getRoom(id))!;
+    assert.equal(r.state, "active");
+    const tx = (await conn.getTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 }))!;
+    assert.equal(r.activeSlot, BigInt(tx.slot), "the slot of the transaction that filled the room");
+    const proof = {
+      seedReveal: new Uint8Array(32).fill(1), blockhash: new Uint8Array(32).fill(2), snapshotHash: new Uint8Array(32).fill(3), replayRoot: new Uint8Array(32).fill(4),
+    };
+    const sig2 = await run([g.finalizeRoyale(authority.publicKey, id, infra.publicKey, liquidity.publicKey, paid.slice(0, 3).map((k) => k.publicKey), [], proof)], [authority]);
+    const line = (await conn.getTransaction(sig2, { commitment: "confirmed", maxSupportedTransactionVersion: 0 }))!.meta!.logMessages!.find((l) => l.startsWith("Program data:"))!;
+    const parts = line.replace("Program data: ", "").split(" ").map((x) => Buffer.from(x, "base64"));
+    assert.equal(parts.length, 7, "kind, room id, four proof parts and the slot");
+    assert.equal(parts[6].readBigUInt64LE(0), BigInt(tx.slot));
+    await run([g.setRequiredSaboteurs(guardian.publicKey, 3)], [guardian]);
   });
 
   test("a VS match needs two paid players; cancel refunds everyone", async () => {
@@ -339,16 +443,17 @@ describe("goshi-escrow native", () => {
     await run([g.cancelRoom(authority.publicKey, id, [paid[0].publicKey])], [authority]);
   });
 
-  test("manual vault withdrawal: only the authority, never more than pending", async () => {
+  test("manual vault withdrawal: only the guardian, never more than pending", async () => {
     const v0 = decodeVault((await conn.getAccountInfo(g.pda.vault))!.data)!;
     const pending = v0.openBurn + v0.openJackpot;
     assert.ok(pending > 0n);
     const dest = Keypair.generate();
     await fund(dest.publicKey, 1);
     await expectCode(run([g.withdrawVault(outsider.publicKey, dest.publicKey, pending)], [outsider]), "Unauthorized");
-    await expectCode(run([g.withdrawVault(authority.publicKey, dest.publicKey, pending + 1n)], [authority]), "NothingPending");
+    await expectCode(run([g.withdrawVault(authority.publicKey, dest.publicKey, pending)], [authority]), "Unauthorized");
+    await expectCode(run([g.withdrawVault(guardian.publicKey, dest.publicKey, pending + 1n)], [guardian]), "NothingPending");
     const before = await bal(dest.publicKey);
-    await run([g.withdrawVault(authority.publicKey, dest.publicKey, pending)], [authority]);
+    await run([g.withdrawVault(guardian.publicKey, dest.publicKey, pending)], [guardian]);
     assert.equal((await bal(dest.publicKey)) - before, pending);
     const v1 = decodeVault((await conn.getAccountInfo(g.pda.vault))!.data)!;
     assert.equal(v1.openBurn + v1.openJackpot, 0n);

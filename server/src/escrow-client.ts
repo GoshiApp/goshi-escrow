@@ -7,8 +7,9 @@ export const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9
 
 export const MAX_PAID = 10;
 export const MAX_FREE = 3;
-export const CONFIG_LEN = 140;
-export const ROOM_LEN = 471;
+export const CONFIG_LEN = 172;
+export const LEGACY_CONFIG_LEN = 140;
+export const ROOM_LEN = 487;
 export const VAULT_LEN = 18;
 
 const u64 = (n: bigint | number) => {
@@ -63,7 +64,8 @@ export class GoshiEscrow {
     this.pda = pdas(programId);
   }
 
-  initialize(authority: PublicKey, infra: PublicKey, liquidity: PublicKey, mint: PublicKey, minHolder: bigint, requiredSaboteurs: number) {
+  /** `guardian`: the cold key (or multisig) that controls the house wallets, the vault and the settings. Default: the authority itself. */
+  initialize(authority: PublicKey, infra: PublicKey, liquidity: PublicKey, mint: PublicKey, minHolder: bigint, requiredSaboteurs: number, guardian?: PublicKey) {
     return ix(
       this.programId,
       [
@@ -75,16 +77,17 @@ export class GoshiEscrow {
         { pubkey: mint },
         { pubkey: SystemProgram.programId },
       ],
-      cat(Uint8Array.of(0), u64(minHolder), Uint8Array.of(requiredSaboteurs))
+      cat(Uint8Array.of(0), u64(minHolder), Uint8Array.of(requiredSaboteurs), ...(guardian ? [guardian.toBytes()] : []))
     );
   }
 
-  setMinHolder(authority: PublicKey, amount: bigint) {
-    return ix(this.programId, [{ pubkey: authority, isSigner: true }, { pubkey: this.pda.config, isWritable: true }], cat(Uint8Array.of(1), u64(amount)));
+  /** Settings are the guardian's. */
+  setMinHolder(guardian: PublicKey, amount: bigint) {
+    return ix(this.programId, [{ pubkey: guardian, isSigner: true }, { pubkey: this.pda.config, isWritable: true }], cat(Uint8Array.of(1), u64(amount)));
   }
 
-  setRequiredSaboteurs(authority: PublicKey, n: number) {
-    return ix(this.programId, [{ pubkey: authority, isSigner: true }, { pubkey: this.pda.config, isWritable: true }], Uint8Array.of(2, n));
+  setRequiredSaboteurs(guardian: PublicKey, n: number) {
+    return ix(this.programId, [{ pubkey: guardian, isSigner: true }, { pubkey: this.pda.config, isWritable: true }], Uint8Array.of(2, n));
   }
 
   /** `commit`: optional 32 byte seed commitment, logged by the program (nothing is stored). */
@@ -166,21 +169,62 @@ export class GoshiEscrow {
     );
   }
 
-  /** Hands the authority to another key. Both the current and the new key sign. */
-  setAuthority(authority: PublicKey, newAuthority: PublicKey) {
+  /** Hands the game authority to another key. The guardian and the new key sign: a lost or stolen hot key is replaced without it. */
+  setAuthority(guardian: PublicKey, newAuthority: PublicKey) {
     return ix(
       this.programId,
-      [{ pubkey: authority, isSigner: true }, { pubkey: newAuthority, isSigner: true }, { pubkey: this.pda.config, isWritable: true }],
+      [{ pubkey: guardian, isSigner: true }, { pubkey: newAuthority, isSigner: true }, { pubkey: this.pda.config, isWritable: true }],
       Uint8Array.of(14)
     );
   }
 
-  /** Changes the infrastructure and liquidity wallets that receive their share of the fee. */
-  setWallets(authority: PublicKey, infra: PublicKey, liquidity: PublicKey) {
+  /** Changes the infrastructure and liquidity wallets that receive their share of the fee (guardian only). */
+  setWallets(guardian: PublicKey, infra: PublicKey, liquidity: PublicKey) {
     return ix(
       this.programId,
-      [{ pubkey: authority, isSigner: true }, { pubkey: this.pda.config, isWritable: true }],
+      [{ pubkey: guardian, isSigner: true }, { pubkey: this.pda.config, isWritable: true }],
       cat(Uint8Array.of(15), infra.toBytes(), liquidity.toBytes())
+    );
+  }
+
+  /** Hands the guardian role to another key. The current guardian and the new one sign. */
+  setGuardian(guardian: PublicKey, newGuardian: PublicKey) {
+    return ix(
+      this.programId,
+      [{ pubkey: guardian, isSigner: true }, { pubkey: newGuardian, isSigner: true }, { pubkey: this.pda.config, isWritable: true }],
+      Uint8Array.of(18)
+    );
+  }
+
+  /** Moves a v4 config (140 bytes) to the v5 layout and names the guardian. The stored authority and the guardian sign. */
+  migrateConfig(authority: PublicKey, newGuardian: PublicKey) {
+    return ix(
+      this.programId,
+      [
+        { pubkey: authority, isSigner: true, isWritable: true },
+        { pubkey: newGuardian, isSigner: true },
+        { pubkey: this.pda.config, isWritable: true },
+        { pubkey: SystemProgram.programId },
+      ],
+      Uint8Array.of(19)
+    );
+  }
+
+  /**
+   * Anybody may call it once the room is old enough (3 hours) and still not settled: every paid wallet gets its entry back and
+   * the rent returns to the authority. `refunds`: the room's paid wallets in room order, a pass holder skipped.
+   */
+  refundExpired(caller: PublicKey, roomId: bigint | number, authority: PublicKey, refunds: PublicKey[]) {
+    return ix(
+      this.programId,
+      [
+        { pubkey: caller, isSigner: true, isWritable: true },
+        { pubkey: this.pda.config },
+        { pubkey: this.pda.room(roomId), isWritable: true },
+        { pubkey: authority, isWritable: true },
+        ...refunds.map((pubkey) => ({ pubkey, isWritable: true })),
+      ],
+      Uint8Array.of(17)
     );
   }
 
@@ -257,11 +301,12 @@ export class GoshiEscrow {
     );
   }
 
-  withdrawVault(authority: PublicKey, destination: PublicKey, amount: bigint) {
+  /** The guardian takes what the vault holds (never more than it tracks as pending). */
+  withdrawVault(guardian: PublicKey, destination: PublicKey, amount: bigint) {
     return ix(
       this.programId,
       [
-        { pubkey: authority, isSigner: true },
+        { pubkey: guardian, isSigner: true },
         { pubkey: this.pda.config },
         { pubkey: this.pda.vault, isWritable: true },
         { pubkey: destination, isWritable: true },
@@ -277,6 +322,8 @@ const rdU64 = (d: Uint8Array, o: number) => new DataView(d.buffer, d.byteOffset,
 
 export interface ConfigAccount {
   authority: PublicKey;
+  /** The cold key: house wallets, vault, settings, replacing the authority. */
+  guardian: PublicKey;
   infraWallet: PublicKey;
   liquidityWallet: PublicKey;
   mint: PublicKey;
@@ -287,6 +334,7 @@ export function decodeConfig(d: Uint8Array): ConfigAccount | null {
   if (d.length !== CONFIG_LEN || d[0] !== 1) return null;
   return {
     authority: key(d, 1),
+    guardian: key(d, 140),
     infraWallet: key(d, 33),
     liquidityWallet: key(d, 65),
     mint: key(d, 97),
@@ -306,6 +354,10 @@ export interface RoomAccount {
   passPlayer: PublicKey | null;
   /** The invited wallets of a duel (empty for any other room). */
   guests: PublicKey[];
+  /** Unix time of the creation of the room (the cluster clock). */
+  createdAt: bigint;
+  /** The slot in which the room became active: the seed of the match uses the blockhash of that block. 0n while waiting. */
+  activeSlot: bigint;
 }
 export function decodeRoom(d: Uint8Array): RoomAccount | null {
   if (d.length !== ROOM_LEN || d[0] !== 2) return null;
@@ -327,6 +379,8 @@ export function decodeRoom(d: Uint8Array): RoomAccount | null {
     guests: d[18] === 2
       ? [key(d, 375), key(d, 407), key(d, 439), key(d, 23)].filter((k) => !k.equals(PublicKey.default))
       : [],
+    createdAt: rdU64(d, 471),
+    activeSlot: rdU64(d, 479),
   };
 }
 
@@ -344,5 +398,5 @@ export const ERRORS: Record<number, string> = {
   6000: "Unauthorized", 6001: "InvalidEntryFee", 6002: "RoomMismatch", 6003: "RoomNotWaiting", 6004: "RoomNotActive",
   6005: "RoomFull", 6006: "AlreadyJoined", 6007: "NotEnoughGoshi", 6008: "BadPlayerCount", 6009: "DuplicateWinners",
   6010: "WinnerNotInRoom", 6011: "WrongAccount", 6012: "BadAccounts", 6013: "MathOverflow", 6014: "NothingPending",
-  6015: "BadAccountData", 6016: "AlreadyInitialized", 6017: "BadInstruction",
+  6015: "BadAccountData", 6016: "AlreadyInitialized", 6017: "BadInstruction", 6018: "TooEarly",
 };

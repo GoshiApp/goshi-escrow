@@ -5,6 +5,11 @@ import { config, log } from "./config.js";
 
 let cached: { usd: number; at: number } | null = null;
 const TTL_MS = 60_000;
+/** A pair thinner than this is not a price: a new token has little liquidity and anybody can open a pool with a made up price. */
+const MIN_LIQUIDITY_USD = Number(process.env.GOSHI_MIN_LIQUIDITY_USD ?? "3000");
+/** The price used is the LOWEST seen in this window, so a spike (a thin pool pushed up for a minute) never opens the gate. */
+const WINDOW_MS = 15 * 60_000;
+const seen: { usd: number; at: number }[] = [];
 
 export async function goshiUsd(): Promise<number | null> {
   const manual = Number(process.env.GOSHI_USD ?? "");
@@ -15,10 +20,13 @@ export async function goshiUsd(): Promise<number | null> {
     const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${config.mint}`, { signal: AbortSignal.timeout(6000) });
     if (!r.ok) throw new Error(`dexscreener ${r.status}`);
     const j: any = await r.json();
-    const pairs: any[] = (j.pairs ?? []).filter((p: any) => p.chainId === "solana" && Number(p.priceUsd) > 0);
+    const pairs: any[] = (j.pairs ?? []).filter((p: any) => p.chainId === "solana" && Number(p.priceUsd) > 0 && Number(p.liquidity?.usd ?? 0) >= MIN_LIQUIDITY_USD);
     pairs.sort((a, b) => Number(b.liquidity?.usd ?? 0) - Number(a.liquidity?.usd ?? 0));
-    const usd = Number(pairs[0]?.priceUsd ?? 0);
-    if (!(usd > 0)) throw new Error("no pair");
+    const now = Number(pairs[0]?.priceUsd ?? 0);
+    if (!(now > 0)) throw new Error("no pair with enough liquidity");
+    seen.push({ usd: now, at: Date.now() });
+    while (seen.length > 0 && Date.now() - seen[0].at > WINDOW_MS) seen.shift();
+    const usd = Math.min(...seen.map((x) => x.usd));
     cached = { usd, at: Date.now() };
     return usd;
   } catch (e: any) {

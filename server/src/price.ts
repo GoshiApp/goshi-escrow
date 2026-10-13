@@ -19,24 +19,47 @@ export function build(price: number): FeeOption[] {
   });
 }
 
-/** Refreshes the SOL price at most every 5 minutes. Without a network answer the last price is kept. */
+async function binanceSol(): Promise<number | null> {
+  try {
+    const r = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT", { signal: AbortSignal.timeout(4000) });
+    const p = Number(((await r.json()) as any)?.price);
+    return Number.isFinite(p) && p > 1 && p < 100000 ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Refreshes the SOL price at most every 5 minutes. A move of more than 30 percent in one step is only accepted when a second
+ * source agrees within 3 percent: one wrong answer must not reprice every room. Without an answer the last price is kept.
+ */
 export async function refreshPrice(force = false): Promise<void> {
   if (process.env.SOL_USD) return; // fixed by the operator
   if (!force && Date.now() - fetchedAt < 5 * 60_000) return;
   fetchedAt = Date.now();
   try {
-    const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", {
-      signal: AbortSignal.timeout(4000),
-    });
-    const j: any = await r.json();
-    const p = Number(j?.solana?.usd);
-    if (Number.isFinite(p) && p > 1 && p < 100000) {
-      if (Math.abs(p - solUsd) / solUsd > 0.02) {
-        previous = current;
-        solUsd = p;
-        current = build(solUsd);
-        log("sol_price", { usd: p });
+    let p = NaN;
+    try {
+      const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", { signal: AbortSignal.timeout(4000) });
+      p = Number(((await r.json()) as any)?.solana?.usd);
+    } catch { /* the second source below */ }
+    if (!(Number.isFinite(p) && p > 1 && p < 100000)) {
+      const b = await binanceSol();
+      if (b === null) throw new Error("no price from any source");
+      p = b;
+    }
+    if (Math.abs(p - solUsd) / solUsd > 0.3) {
+      const b = await binanceSol();
+      if (b === null || Math.abs(b - p) / p > 0.03) {
+        log("sol_price_rejected", { usd: p });
+        return;
       }
+    }
+    if (Math.abs(p - solUsd) / solUsd > 0.02) {
+      previous = current;
+      solUsd = p;
+      current = build(solUsd);
+      log("sol_price", { usd: p });
     }
   } catch (e: any) {
     log("sol_price_failed", { error: String(e?.message ?? e).slice(0, 80) });

@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "native": true,
   "requiredSaboteurs": 3,
   "cluster": "devnet",
@@ -11,5 +11,7 @@
   "infraWallet": "JD6zGCtMiwRL6UMuP5a7FN465XDCCuhWzHjU8cQAMQHR",
   "liquidityWallet": "CCQnx7EsybugJQvGj2ky9GBRF2eebXXtVeC8zhAiufkt",
   "minHolder": "100000000",
-  "initializeTx": "wyiYsJLdmhwdvDQmKbjK7jhs9XquhA68b3wjM1d4GxUkSoJ5TGnwuD257BZmw7moyT51YejEK9Kr3P1RNhbADxR"
+  "initializeTx": "wyiYsJLdmhwdvDQmKbjK7jhs9XquhA68b3wjM1d4GxUkSoJ5TGnwuD257BZmw7moyT51YejEK9Kr3P1RNhbADxR",
+  "guardian": "8TWaxecQhYRPasZfCLDSxy3QVTb674kFZJyS3nihwbbh",
+  "migrateTx": "pvXndocmCnYgXPpRQq6rV41iLivbFFi3GHupVzGCjixGPBw4pJEVxJmeSA9KWSvz3r9hNGNsKqpdp6kgQTSvaEa"
 }

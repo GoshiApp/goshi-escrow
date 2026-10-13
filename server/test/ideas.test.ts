@@ -34,6 +34,13 @@ test("propose, vote, sort, report", async () => {
   // three reports hide it
   for (const v of [A, C, D]) await call(`/ideas/${one.j.id}/report`, "POST", { voter: v });
   assert.equal((await call("/ideas")).j.items.some((i: any) => i.id === one.j.id), false);
+  // images: the three of one idea may not weigh more than a document can hold, two big ones may
+  const big = "data:image/png;base64," + Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47]), Buffer.alloc(279_000, 2)]).toString("base64");
+  const three = await call("/ideas", "POST", { voter: "e".repeat(20), title: "Too many pictures", text: "Three huge screenshots in one idea is too much to keep.", images: [big, big, big] });
+  assert.equal(three.code, 400);
+  assert.equal(three.j.error, "image");
+  const two3 = await call("/ideas", "POST", { voter: "f".repeat(20), title: "Two pictures", text: "Two big screenshots still fit in one stored document.", images: [big, big] });
+  assert.equal(two3.code, 200);
   srv.closeAllConnections();
   setTimeout(() => process.exit(0), 100).unref();
   srv.close();

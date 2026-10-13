@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Nothing is read or written from a browser or an app: every page talks to the game server, which uses its own service
+    // account (that does not go through these rules). Deny by default so a click in a console can never open the data.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

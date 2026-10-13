@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 // Settlement rules for a room, in lamports (integer math, every part is accounted for, remainders go to a stated bucket).
 // Pure functions: no network, no chain. The on-chain program and the swap step must implement exactly these numbers.
 //
@@ -121,4 +122,18 @@ export function settleDuel(entry: bigint, ranking: string[]): Settlement {
   const rake = pct(pot, DUEL_RAKE_PCT);
   const winner = pot - rake;
   return finish({ mode: "duel", pot, rake, rakeParts: rakeSplit(rake), payouts: [{ wallet: ranking[0], rank: 1, kind: "sol", lamports: winner }], unclaimed: 0n, unclaimedParts: { burn: 0n, jackpot: 0n } });
+}
+
+/**
+ * The super pot event of a full royale: 1 in `oneIn` rooms. It is drawn from the SAME material as the map, the secret that was
+ * committed on chain when the room was created and the blockhash of the block where the room filled, so nobody (the server
+ * included) can pick the moment and anybody can recompute it from the proof of the match.
+ */
+export function jackpotDraw(secret: Uint8Array, blockhash: Uint8Array, roomId: string, oneIn: number): boolean {
+  if (!Number.isInteger(oneIn) || oneIn < 1) return false;
+  if (oneIn === 1) return true;
+  const id = Buffer.alloc(8);
+  if (/^\d+$/.test(roomId)) id.writeBigUInt64LE(BigInt(roomId));
+  const h = createHash("sha256").update("goshi-jackpot-v1").update(secret).update(blockhash).update(id).digest();
+  return h.readUInt32LE(0) % oneIn === 0;
 }

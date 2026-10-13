@@ -104,10 +104,22 @@ Determinism: fixed step 20 Hz, the direction is quantized to one byte (256 headi
 `simulate(map, entries)` gives the same final state anywhere. Replay file: `GR\x01 | seed u32 | snapshot hash prefix 8 | n u16 | n x (tick u16, angle u8, flags u8)`
 with flags bit 0 = nitro, bit 1 = standing. A minute is usually under 1 KB. `GET /replay/<roomId>/<wallet>` returns the bytes of the last 60 matches.
 
-Fair seed: when a room is created the server logs `sha256(secret)` in the `create_room` transaction. At the start the seed is
-`sha256(secret | blockhash | room id)` (first 4 bytes). At settlement the program logs `proof = secret | blockhash | price snapshot hash | replay root`
-(`Program data` of the closing transaction, nothing stored). `end.proof` carries the same values and the snapshot signature.
+Fair seed: when a room is created the server logs `sha256(secret)` in the `create_room` transaction. The room records the SLOT in which it
+became active (the transaction of the last join, or the authority's `start_vs` / `start_duel`), and the seed is
+`sha256(secret | blockhash of that slot | room id)` (first 4 bytes). Nobody, the server included, knows that blockhash before the
+transaction that fills the room is sent, so the seed cannot be steered; anybody can read the same block afterwards (`getBlock(slot)`).
+If the block cannot be read the match does not start (it is refunded after repeated failures): there is no fallback to a hash the server
+could choose. At settlement the program logs `proof = secret | blockhash | price snapshot hash | replay root | slot`
+(`Program data` of the closing transaction, nothing stored). `end.proof` carries the same values, the snapshot signature and `slot`.
 Prices come from CoinGecko, then Binance (Pyth Hermes now needs an API key); `snapshot.source` says which one, or `fallback`.
+
+Super pot event: after a full royale of 10 paid players the event is drawn as
+`sha256("goshi-jackpot-v1" | secret | blockhash | room id u64 LE)` read as u32 little endian, modulo `oneIn` (100), equal to 0.
+`end.proof.jackpot` says `{ oneIn, drawn }`; the web recomputes it. The payment itself is made by the team from the vault (guardian key).
+
+Roles on chain: the `authority` (hot, held by this server) opens, starts and settles rooms. The `guardian` (cold) alone changes the house
+wallets and the settings, empties the vault, replaces the authority or replaces itself. Anybody can call `refund_expired` once a room is
+3 hours old and still unsettled. On mainnet the server refuses to start if the guardian or the program's upgrade authority is the key it holds.
 
 Landing page: `{ t: "stats", on: true }` (no wallet) subscribes to `{ t: "stats", online, playing, matches, volume, prices, solUsd }` every 2 s.
 Totals are since the server started and are not persisted yet.

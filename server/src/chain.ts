@@ -9,7 +9,7 @@ import {
 } from "@solana/spl-token";
 import { config, loadAuthority, log } from "./config.js";
 import { dropSecret, persistSecret } from "./secrets.js";
-import { GoshiEscrow, ROOM_LEN, decodeRoom, decodeVault, type Proof, type RoomAccount } from "./escrow-client.js";
+import { GoshiEscrow, ROOM_LEN, decodeConfig, decodeRoom, decodeVault, type Proof, type RoomAccount } from "./escrow-client.js";
 
 export interface ChainRoom {
   id: string;
@@ -23,6 +23,10 @@ export interface ChainRoom {
   passPlayer: string | null;
   /** The invited wallets of a duel (empty for other rooms). */
   guests: string[];
+  /** Unix time of its creation, from the cluster clock. */
+  createdAt: number;
+  /** The slot in which the room became active; "0" while it waits. The seed uses the blockhash of that block. */
+  activeSlot: string;
 }
 
 const authority = loadAuthority();
@@ -52,6 +56,8 @@ function toRoom(pubkey: PublicKey, a: RoomAccount): ChainRoom {
     passes: a.passes,
     passPlayer: a.passPlayer ? a.passPlayer.toBase58() : null,
     guests: a.guests.map((g) => g.toBase58()),
+    createdAt: Number(a.createdAt),
+    activeSlot: a.activeSlot.toString(),
   };
 }
 
@@ -241,6 +247,47 @@ export async function cancelRoom(roomId: string, paid: string[], passPlayer: str
   return tx;
 }
 
-export async function setMinHolder(amount: bigint): Promise<string> {
-  return send([escrow.setMinHolder(authority.publicKey, amount)], authority);
+/**
+ * The blockhash of the block in which a room became active. Nobody knows it before the transaction that fills the room is sent,
+ * so the seed cannot be steered, and anybody can read the same block later. Fails (never falls back to something else).
+ */
+export async function blockhashOfSlot(slot: bigint): Promise<Uint8Array> {
+  let last = "";
+  for (let i = 0; i < 6; i++) {
+    try {
+      const r = await fetch(config.rpcUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getBlock", params: [Number(slot), { commitment: "confirmed", transactionDetails: "none", rewards: false, maxSupportedTransactionVersion: 0 }] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const j: any = await r.json();
+      const h = j?.result?.blockhash;
+      if (typeof h === "string") return bs58.decode(h);
+      last = String(j?.error?.message ?? "no block").slice(0, 80);
+    } catch (e: any) {
+      last = String(e?.message ?? e).slice(0, 80);
+    }
+    await new Promise((res) => setTimeout(res, 1200 * (i + 1)));
+  }
+  throw new Error(`the block of slot ${slot} is not available: ${last}`);
+}
+
+/**
+ * The upgrade authority of the program (BPF upgradeable loader), or null when it is immutable. Used to refuse to run on mainnet
+ * with the same key as the game authority.
+ */
+export async function upgradeAuthorityOf(programId: PublicKey): Promise<PublicKey | null | undefined> {
+  const prog = await connection.getAccountInfo(programId);
+  if (!prog || prog.data.length < 36 || prog.data.readUInt32LE(0) !== 2) return undefined;
+  const pd = await connection.getAccountInfo(new PublicKey(prog.data.subarray(4, 36)));
+  if (!pd || pd.data.length < 45 || pd.data.readUInt32LE(0) !== 3) return undefined;
+  return pd.data[12] === 1 ? new PublicKey(pd.data.subarray(13, 45)) : null;
+}
+
+/** The roles recorded in the program's configuration on chain. */
+export async function onChainRoles(): Promise<{ authority: PublicKey; guardian: PublicKey } | null> {
+  const a = await connection.getAccountInfo(configPda);
+  const c = a ? decodeConfig(a.data) : null;
+  return c ? { authority: c.authority, guardian: c.guardian } : null;
 }

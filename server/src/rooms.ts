@@ -14,11 +14,11 @@ import { maintenancePublic, maintenanceState, newMatchesAllowed } from "./mainte
 import { settleDuel } from "./game/settlement.js";
 import { FOUNDER_SKINS, SKIN_HOLD_USD, isFounder, isKnownSkin } from "./game/skins.js";
 import { authMessage, makeSession, newNonce, SESSION_TTL_MS, sessionSecretFrom, verifyAuth, verifySession } from "./auth.js";
-import { authority, cancelRoom, createRoom, currentBlockhash, fetchRoom, finalizeDuel, finalizeRoyale, buildDuelTx, finalizeVs, forgetSecret, startDuel, joinWithPass, listRooms, roomSecret, startVs, type ChainRoom } from "./chain.js";
+import { authority, cancelRoom, createRoom, blockhashOfSlot, fetchRoom, finalizeDuel, finalizeRoyale, buildDuelTx, finalizeVs, forgetSecret, startDuel, joinWithPass, listRooms, roomSecret, startVs, type ChainRoom } from "./chain.js";
 import { Match, type FrenzyOptions, type MatchResult } from "./match.js";
 import { latestSnapshot, takeSnapshot } from "./snapshot.js";
 import { addMatch, addVisit, counts } from "./counters.js";
-import { settleRoyale, settleVs } from "./game/settlement.js";
+import { jackpotDraw, settleRoyale, settleVs } from "./game/settlement.js";
 import { faucet, fillWithBots, isBot } from "./devbots.js";
 import { feeAllowed, feeOfTier, feeOptions, refreshPrice, solPriceUsd, tierUsdOf } from "./price.js";
 
@@ -36,7 +36,18 @@ export interface Client {
   visitCounted?: boolean;
   /** The random browser id (never an address): lets several tabs of one browser count as one person. */
   vid?: string;
+  /** The address the connection came from (as Google's front end saw it): only used for limits, never stored. */
+  ip?: string;
+  /** Budget of room lookups that need a call to the node (refilled over time), so a client cannot turn messages into RPC calls. */
+  lookups?: number;
 }
+
+/** A room id is a u64 written in decimal. Anything else is refused before it costs a lookup or a byte of memory. */
+const ROOM_ID = /^\d{10,20}$/;
+const roomIdOf = (v: unknown): string | null => ((typeof v === "string" || typeof v === "number") && ROOM_ID.test(String(v)) ? String(v) : null);
+const MAX_WATCHING = 20;
+const MAX_PRACTICE_PER_IP = 6;
+const ROOMS_PER_IP_PER_HOUR = 20;
 
 interface Pending {
   mode: "royale" | "vs" | "duel";
@@ -57,7 +68,9 @@ interface Entry {
   offer?: { expires: number; accepted: Set<string> };
   lastLobby: string;
   /** Revealed at settlement: the committed secret and the blockhash the seed used. */
-  seedParts?: { secret: Buffer; blockhash: Uint8Array };
+  seedParts?: { secret: Buffer; blockhash: Uint8Array; slot: string };
+  /** How many times the block of the activation slot could not be read yet (the match starts when it can). */
+  seedTries?: number;
 }
 
 const SESSION_SECRET = sessionSecretFrom(authority.secretKey);
@@ -73,14 +86,8 @@ const sha256 = (...parts: (Uint8Array | string)[]) => {
  * Everything a room needs to be reproducible: the seed from sha256(secret, blockhash, room id), the frozen price photo and
  * the signature of that photo. The secret was committed to when the room was created and is revealed at settlement.
  */
-async function frenzyFor(roomId: string, known?: Buffer) {
+async function frenzyFor(roomId: string, known: Buffer | undefined, blockhash: Uint8Array) {
   const secret = known ?? crypto.randomBytes(32);
-  let blockhash: Uint8Array;
-  try {
-    blockhash = await currentBlockhash();
-  } catch {
-    blockhash = crypto.randomBytes(32);
-  }
   const idBytes = /^\d+$/.test(roomId) ? (() => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(roomId)); return b; })() : sha256(roomId).subarray(0, 8);
   const seedHash = sha256(secret, blockhash, idBytes);
   const seed = (seedHash.readUInt32LE(0) & 0x7fffffff) || 1;
@@ -100,6 +107,10 @@ export class Hub extends EventEmitter {
   readonly clients = new Set<Client>();
   readonly rooms = new Map<string, Entry>();
   private created = new Map<string, number[]>();
+  /** Rooms and duels started from one address in the last hour (a script with fresh wallets is still one address). */
+  private createdByIp = new Map<string, number[]>();
+  /** Room ids the node said do not exist, remembered for a few seconds so repeated asks cost nothing. */
+  private missing = new Map<string, number>();
   /** Wallet -> cosmetic skin id (validated), used when a room starts. */
   private skinOf = new Map<string, string>();
   /** Private duels waiting or running: room id -> creator and size. Persisted so a restart does not forget them. */
@@ -183,9 +194,9 @@ export class Hub extends EventEmitter {
 
   // ───────────── connections ─────────────
 
-  connect(ws: WebSocket): Client {
+  connect(ws: WebSocket, ip?: string): Client {
     void refreshPrice();
-    const c: Client = { ws, nonce: newNonce(), watching: new Set(), tokens: 60, lastRefill: Date.now() };
+    const c: Client = { ws, nonce: newNonce(), watching: new Set(), tokens: 60, lastRefill: Date.now(), ip, lookups: 10 };
     this.clients.add(c);
     send(c, {
       t: "hello",
@@ -234,6 +245,7 @@ export class Hub extends EventEmitter {
 
   async handle(c: Client, raw: string) {
     const now = Date.now();
+    c.lookups = Math.min(10, (c.lookups ?? 10) + (now - c.lastRefill) / 1000);
     c.tokens = Math.min(60, c.tokens + ((now - c.lastRefill) / 1000) * 60);
     c.lastRefill = now;
     if (c.tokens < 1) return;
@@ -301,18 +313,26 @@ export class Hub extends EventEmitter {
           return await this.onCreateRoom(c, msg);
         case "quick":
           return await this.onQuick(c, msg);
-        case "acceptPass":
-          return await this.onAcceptPass(c, String(msg.roomId));
+        case "acceptPass": {
+          const id = roomIdOf(msg.roomId);
+          return id ? await this.onAcceptPass(c, id) : err(c, "bad_room", "That room id is not valid.");
+        }
         case "fillWithBots":
-          return await this.onFill(c, msg);
+          return roomIdOf(msg.roomId) ? await this.onFill(c, msg) : err(c, "bad_room", "That room id is not valid.");
         case "faucet":
           return await this.onFaucet(c);
-        case "watch":
-          return await this.onWatch(c, String(msg.roomId));
-        case "enter":
-          return await this.onEnter(c, String(msg.roomId));
-        case "vs":
-          return this.onVs(c, String(msg.roomId), !!msg.accept);
+        case "watch": {
+          const id = roomIdOf(msg.roomId);
+          return id ? await this.onWatch(c, id) : err(c, "bad_room", "That room id is not valid.");
+        }
+        case "enter": {
+          const id = roomIdOf(msg.roomId);
+          return id ? await this.onEnter(c, id) : err(c, "bad_room", "That room id is not valid.");
+        }
+        case "vs": {
+          const id = roomIdOf(msg.roomId);
+          return id ? this.onVs(c, id, !!msg.accept) : err(c, "bad_room", "That room id is not valid.");
+        }
         case "ref": {
           const r = String(msg.ref ?? "");
           if (c.wallet && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(r)) void setReferrer(c.wallet, r);
@@ -320,14 +340,18 @@ export class Hub extends EventEmitter {
         }
         case "createDuel":
           return void (await this.onCreateDuel(c, msg));
-        case "startDuel":
-          return void (await this.onStartDuel(c, String(msg.roomId)));
+        case "startDuel": {
+          const id = roomIdOf(msg.roomId);
+          return void (id ? await this.onStartDuel(c, id) : err(c, "bad_room", "That room id is not valid."));
+        }
         case "skin":
           return void (await this.onSkin(c, msg));
         case "input":
           return this.onInput(c, msg);
-        case "leave":
-          return this.onLeave(c, String(msg.roomId));
+        case "leave": {
+          const id = roomIdOf(msg.roomId);
+          return id ? this.onLeave(c, id) : undefined;
+        }
         default:
           return err(c, "unknown_message", "Unknown message type.");
       }
@@ -346,8 +370,10 @@ export class Hub extends EventEmitter {
       c.practice = undefined;
     }
     if (maintenanceState() === "down") return err(c, "maintenance", "Scheduled maintenance: practice is closed until it ends.");
-    const running = [...this.clients].filter((x) => x.practice).length;
-    if (running >= config.maxPractice) return err(c, "busy", "Practice is full right now, try again in a minute.");
+    const live = [...this.clients].filter((x) => x.practice);
+    if (live.length >= config.maxPractice) return err(c, "busy", "Practice is full right now, try again in a minute.");
+    // One address cannot fill every practice slot and shut everybody else out.
+    if (c.ip && live.filter((x) => x.ip === c.ip).length >= MAX_PRACTICE_PER_IP) return err(c, "busy", "Too many practice matches from your connection, finish one first.");
     const you = `you_${crypto.randomBytes(6).toString("hex")}`;
     const prizeWallet = typeof msg.wallet === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(msg.wallet) ? msg.wallet : null;
     const raw = typeof msg.name === "string" ? msg.name.replace(/[^\p{L}\p{N} _-]/gu, "").slice(0, 14).trim() : "";
@@ -361,7 +387,8 @@ export class Hub extends EventEmitter {
       })),
     ];
     const id = `practice-${crypto.randomBytes(4).toString("hex")}`;
-    const fz = await frenzyFor(id);
+    // A practice match has no chain: its seed is random, and it says so (no proof is published for it).
+    const fz = await frenzyFor(id, undefined, crypto.randomBytes(32));
     const match = new Match(
       id,
       "royale",
@@ -431,6 +458,7 @@ export class Hub extends EventEmitter {
     const hourAgo = Date.now() - 3600_000;
     const mine = (this.created.get(c.wallet!) ?? []).filter((t) => t > hourAgo);
     if (mine.length >= config.roomsPerWalletPerHour) return err(c, "rate_limited", "Too many rooms created, try again later.");
+    if (this.ipLimited(c)) return err(c, "rate_limited", "Too many rooms created from your connection, try again later.");
     const open = [...this.rooms.values()].filter((e) => e.chain.state === "waiting").length;
     if (open >= config.maxOpenRooms) return err(c, "too_many_rooms", "Too many open rooms right now.");
 
@@ -471,6 +499,7 @@ export class Hub extends EventEmitter {
     const hourAgo = Date.now() - 3600_000;
     const mine = (this.created.get(me) ?? []).filter((t) => t > hourAgo);
     if (mine.length >= limits.sol.maxDuelsPerWalletPerHour) return err(c, "rate_limited", "Too many duels created, try again later.");
+    if (this.ipLimited(c)) return err(c, "rate_limited", "Too many duels created from your connection, try again later.");
     const openAll = [...this.rooms.values()].filter((e) => e.chain.state === "waiting").length;
     if (openAll >= config.maxOpenRooms) return err(c, "too_many_rooms", "Too many open rooms right now.");
     mine.push(Date.now());
@@ -482,7 +511,7 @@ export class Hub extends EventEmitter {
   }
 
   private async onStartDuel(c: Client, roomId: string) {
-    const e = await this.entryFor(roomId);
+    const e = await this.entryFor(roomId, c);
     if (!e || !this.duelMeta.has(roomId)) return err(c, "no_room", "That duel does not exist.");
     if (this.duelMeta.get(roomId)!.creator !== c.wallet) return err(c, "not_creator", "Only who made the duel can start it early.");
     if (e.chain.state !== "waiting" || e.chain.paid.length < limits.sol.duelPlayers[0]) return err(c, "not_ready", "The duel needs at least two players.");
@@ -517,6 +546,7 @@ export class Hub extends EventEmitter {
     const hourAgo = Date.now() - 3600_000;
     const mine = (this.created.get(me) ?? []).filter((t) => t > hourAgo);
     if (mine.length >= config.roomsPerWalletPerHour) return err(c, "rate_limited", "Too many rooms created, try again later.");
+    if (this.ipLimited(c)) return err(c, "rate_limited", "Too many rooms created from your connection, try again later.");
     const open = [...this.rooms.values()].filter((e) => e.chain.state === "waiting").length;
     if (open >= config.maxOpenRooms) return err(c, "too_many_rooms", "Too many open rooms right now.");
     mine.push(Date.now());
@@ -557,29 +587,55 @@ export class Hub extends EventEmitter {
     }
   }
 
+  /** True when this address already started its share of rooms this hour; records the attempt otherwise. */
+  private ipLimited(c: Client): boolean {
+    if (!c.ip) return false;
+    const hourAgo = Date.now() - 3600_000;
+    const mine = (this.createdByIp.get(c.ip) ?? []).filter((t) => t > hourAgo);
+    if (mine.length >= ROOMS_PER_IP_PER_HOUR) { this.createdByIp.set(c.ip, mine); return true; }
+    mine.push(Date.now());
+    this.createdByIp.set(c.ip, mine);
+    if (this.createdByIp.size > 5000) for (const [k, v] of this.createdByIp) if (v.every((t) => t <= hourAgo)) this.createdByIp.delete(k);
+    return false;
+  }
+
   /** The registry entry of a room, created from the chain if the poll has not seen the room yet. */
-  private async entryFor(roomId: string): Promise<Entry | undefined> {
+  private async entryFor(roomId: string, c?: Client): Promise<Entry | undefined> {
     const known = this.rooms.get(roomId);
     if (known) return known;
+    const now = Date.now();
+    const gone = this.missing.get(roomId);
+    if (gone !== undefined && now - gone < 15_000) return undefined;
+    // Looking a room up costs a call to the node: a client gets a small budget that refills slowly.
+    if (c) {
+      if ((c.lookups ?? 10) < 1) return undefined;
+      c.lookups = (c.lookups ?? 10) - 1;
+    }
     const chain = await fetchRoom(roomId);
-    if (!chain) return undefined;
+    if (!chain) {
+      this.missing.set(roomId, now);
+      if (this.missing.size > 500) for (const [k, t] of this.missing) if (now - t > 15_000) this.missing.delete(k);
+      return undefined;
+    }
     const e: Entry = this.rooms.get(roomId) ?? { chain, watchers: new Set(), firstSeen: Date.now(), lastLobby: "" };
     this.rooms.set(roomId, e);
     return e;
   }
 
   private async onWatch(c: Client, roomId: string) {
-    const e = await this.entryFor(roomId);
-    c.watching.add(roomId);
+    const e = await this.entryFor(roomId, c);
     if (!e) return err(c, "no_room", "That room does not exist.");
+    // Only rooms that exist are remembered, and only a few: a connection cannot grow its own state without limit.
+    if (c.watching.size >= MAX_WATCHING && !c.watching.has(roomId)) return err(c, "too_many_rooms", "You are watching too many rooms.");
+    c.watching.add(roomId);
     e.watchers.add(c);
     send(c, this.lobbyMsg(e));
     if (e.match && !e.match.ended) send(c, e.match.startMsg(c.wallet!));
   }
 
   private async onEnter(c: Client, roomId: string) {
-    const e = await this.entryFor(roomId);
-    const chain = e?.chain ?? (await fetchRoom(roomId));
+    const e = await this.entryFor(roomId, c);
+    const chain = e?.chain;
     const w = c.wallet!;
     const role = chain?.paid.includes(w) ? "paid" : chain?.free.includes(w) ? "saboteur" : null;
     // Anyone can watch a duel that is being played (it is a public match); only the seated can steer.
@@ -778,9 +834,36 @@ export class Hub extends EventEmitter {
       }
       return;
     }
+    // The seed uses the blockhash of the block in which the room filled: unknown to everybody (the server included) before the
+    // transaction that fills it is sent, and readable by anybody afterwards. If that block cannot be read yet, wait; if it never
+    // can, refund. There is no fallback to a blockhash the server could choose.
+    const slot = BigInt(e.chain.activeSlot || "0");
+    let blockhash: Uint8Array | null = null;
+    if (slot > 0n) {
+      try {
+        blockhash = await blockhashOfSlot(slot);
+      } catch (ex: any) {
+        e.seedTries = (e.seedTries ?? 0) + 1;
+        log("seed_block_unavailable", { roomId, slot: slot.toString(), tries: e.seedTries, error: String(ex?.message ?? ex).slice(0, 120) });
+      }
+    }
+    if (!blockhash) {
+      if (slot === 0n || (e.seedTries ?? 0) >= 12) {
+        try {
+          await cancelRoom(roomId, e.chain.paid, e.chain.passPlayer);
+          this.broadcast(e, { t: "error", code: "seed_unavailable", message: "The match could not be seeded fairly, so it was cancelled and every entry refunded." });
+          this.rooms.delete(roomId);
+          forgetSecret(roomId);
+        } catch (ex: any) {
+          log("room_refund_failed", { roomId, error: String(ex?.message ?? ex).slice(0, 160) });
+        }
+      }
+      e.starting = false;
+      return;
+    }
     void markStarted(roomId);
-    const fz = await frenzyFor(roomId, known);
-    e.seedParts = { secret: fz.secret, blockhash: fz.blockhash };
+    const fz = await frenzyFor(roomId, known, blockhash);
+    e.seedParts = { secret: fz.secret, blockhash: fz.blockhash, slot: slot.toString() };
     const startsAt = Date.now() + config.countdownMs;
     const isDuel = e.chain.mode === "duel";
     const match = new Match(
@@ -823,8 +906,9 @@ export class Hub extends EventEmitter {
         unclaimed: "0",
         jackpot: { triggered: false, amount: "0", winner: null as string | null },
       };
-      // Jackpot event: 1 in `jackpotOneIn` after a full royale of 10 paid players.
-      if (chain.paid.length === config.paidSlots && crypto.randomInt(0, config.jackpotOneIn) === 0) {
+      // Jackpot event: 1 in `jackpotOneIn` after a full royale of 10 paid players, drawn from the committed secret and the
+      // blockhash of the block where the room filled, so it can be recomputed from the proof (see jackpotDraw).
+      if (chain.paid.length === config.paidSlots && e.seedParts && jackpotDraw(e.seedParts.secret, e.seedParts.blockhash, chain.id, config.jackpotOneIn)) {
         jackpotWinner = top[0]?.w ?? null;
         log("jackpot_event", { roomId: chain.id, winner: jackpotWinner });
       }
@@ -906,6 +990,9 @@ export class Hub extends EventEmitter {
               commit: e.match.frenzyOpts.commit,
               seedReveal: e.seedParts.secret.toString("hex"),
               blockhash: Buffer.from(e.seedParts.blockhash).toString("hex"),
+              /** The slot of the block that blockhash belongs to: the one in which the room became active. */
+              slot: e.seedParts.slot,
+              jackpot: { oneIn: config.jackpotOneIn, drawn: jackpotDraw(e.seedParts.secret, e.seedParts.blockhash, roomId, config.jackpotOneIn) },
               snapshot: e.match.frenzyOpts.snapshot,
               signature: e.match.frenzyOpts.signature,
               replays: e.match.replayIndex(),

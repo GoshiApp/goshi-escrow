@@ -31,8 +31,20 @@ const dirty = new Set<string>();
 let storeOn = false;
 const COL = "ideas";
 
-const LIMITS = { title: [4, 80], text: [20, 1500], images: 3, imageBytes: 280_000, body: 1_300_000, hideAfterReports: 3, maxIdeas: 2000 } as const;
+const LIMITS = {
+  title: [4, 80], text: [20, 1500], images: 3, imageBytes: 280_000, body: 1_300_000, hideAfterReports: 3, maxIdeas: 2000,
+  /** All the images of one idea together, as stored (a Firestore document is at most 1 MiB). */
+  ideaImageChars: 800_000,
+  /** All the images of every idea together: what the board may keep in memory. */
+  boardImageChars: 40_000_000,
+} as const;
 const ADMIN = process.env.IDEAS_ADMIN ?? "";
+/** Compares two secrets without leaking, through timing, how many leading characters matched. */
+const sameSecret = (given: unknown, want: string): boolean => {
+  if (want === "" || typeof given !== "string") return false;
+  const a = Buffer.from(given), b = Buffer.from(want);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+};
 
 // ───────────── holder gate ─────────────
 // With IDEAS_GATE=on, proposing, voting and reporting need a wallet that holds at least IDEAS_MIN_USD (20) worth of the token. The person
@@ -43,7 +55,8 @@ const GATE = process.env.IDEAS_GATE === "on";
 const MIN_USD = Number(process.env.IDEAS_MIN_USD ?? "20");
 // The chain module (and the authority key it loads) is only needed when the gate is on.
 const chain = await import("./chain.js").catch(() => null);
-const SESSION_SECRET = chain ? sessionSecretFrom(chain.authority.secretKey) : Buffer.alloc(32);
+// Without the authority key there is nothing to sign sessions with: they are refused, never signed with a known key.
+const SESSION_SECRET = chain ? sessionSecretFrom(chain.authority.secretKey) : crypto.randomBytes(32);
 const goshiMintText = chain ? chain.mint.toBase58() : "";
 const nonces = new Map<string, number>();
 const holdCache = new Map<string, { ok: boolean; ui: number; usd: number; at: number }>();
@@ -253,7 +266,8 @@ const clientIp = (req: http.IncomingMessage): string => {
 
 /** Handles /ideas routes. Returns false when the request is not for this module. */
 export function handleIdeas(req: http.IncomingMessage, res: http.ServerResponse, allowedOrigins: readonly string[]): boolean {
-  const url = new URL(req.url ?? "/", "http://x");
+  let url: URL;
+  try { url = new URL(req.url ?? "/", "http://x"); } catch { return false; }
   if (url.pathname !== "/ideas" && !url.pathname.startsWith("/ideas/")) return false;
   const origin = String(req.headers.origin ?? "");
   const cors: Record<string, string> = allowedOrigins.includes(origin)
@@ -267,7 +281,7 @@ export function handleIdeas(req: http.IncomingMessage, res: http.ServerResponse,
   if (req.method !== "GET" && origin && !allowedOrigins.includes(origin)) return send(403, { error: "origin" }), true;
   const ip = clientIp(req);
   const parts = url.pathname.split("/").filter(Boolean); // ["ideas", id?, action?]
-  const admin = ADMIN !== "" && req.headers["x-admin-token"] === ADMIN;
+  const admin = sameSecret(req.headers["x-admin-token"], ADMIN);
 
   void (async () => {
     try {
@@ -325,11 +339,17 @@ export function handleIdeas(req: http.IncomingMessage, res: http.ServerResponse,
         if (b.website) return send(200, { ok: true }); // honeypot: bots fill every field
         if (title.length < LIMITS.title[0] || text.length < LIMITS.text[0]) return send(400, { error: "short" });
         const imgs: string[] = [];
+        let chars = 0;
         for (const d of Array.isArray(b.images) ? b.images.slice(0, LIMITS.images) : []) {
           const ok = imageOk(d);
           if (!ok) return send(400, { error: "image" });
+          chars += ok.length;
           imgs.push(ok);
         }
+        if (chars > LIMITS.ideaImageChars) return send(400, { error: "image" });
+        let board = 0;
+        for (const o of ideas.values()) for (const im of o.images) board += im.length;
+        if (board + chars > LIMITS.boardImageChars) return send(503, { error: "full" });
         if (limited(ip, "create", 3, 3_600_000) || limited(ip, "create-day", 8, 86_400_000)) return send(429, { error: "too_many" });
         // The same text twice in a row is a double click or a bot, not a second idea.
         for (const o of ideas.values()) if (o.title.toLowerCase() === title.toLowerCase() && o.text === text) return send(200, { ok: true, id: o.id });

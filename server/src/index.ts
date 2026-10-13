@@ -9,12 +9,24 @@ import { handleIdeas, startIdeas, flushIdeas, limited, realIp } from "./ideas.js
 import { statsOf } from "./referrals.js";
 import { maintenancePublic, setMaintenance, startMaintenance } from "./maintenance.js";
 import { matchById, matchByTx, matchesByHash, matchesOfWallet, recentMatches, storedReplay } from "./archive.js";
+import { assertKeysSeparated } from "./keys.js";
 
 // A rate limited RPC answer must never take the server down: log it and keep serving (rooms in memory would be lost).
 process.on("uncaughtException", (e) => log("uncaught_exception", { error: String((e as Error)?.message ?? e).slice(0, 200) }));
 process.on("unhandledRejection", (e) => log("unhandled_rejection", { error: String((e as Error)?.message ?? e).slice(0, 200) }));
 
 const hub = new Hub();
+
+/** Answers of the public read endpoints, kept a few seconds: a script (or a crowd) asking the same thing costs one read. */
+const readCache = new Map<string, { at: number; body: string }>();
+async function cachedJson(key: string, ttlMs: number, compute: () => Promise<unknown>): Promise<string> {
+  const hit = readCache.get(key);
+  if (hit && Date.now() - hit.at < ttlMs) return hit.body;
+  const body = JSON.stringify(await compute());
+  readCache.set(key, { at: Date.now(), body });
+  if (readCache.size > 400) for (const [k, v] of readCache) if (Date.now() - v.at > ttlMs) readCache.delete(k);
+  return body;
+}
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
@@ -24,8 +36,11 @@ const server = http.createServer((req, res) => {
   }
   const m = /^\/replay\/([0-9A-Za-z_-]{1,40})\/([0-9A-Za-z_]{1,64})$/.exec(req.url ?? "");
   if (m) {
+    // A file that is in memory costs nothing; one that has to be read from the archive is limited per address.
+    const mem = hub.replayOf(m[1], m[2]);
+    if (!mem && limited(realIp(req), "replay", 90, 60_000)) return void res.writeHead(429, { "access-control-allow-origin": "*", "retry-after": "30" }).end();
     void (async () => {
-      const b = hub.replayOf(m[1], m[2]) ?? (await storedReplay(m[1], m[2]));
+      const b = mem ?? (await storedReplay(m[1], m[2]));
       if (!b) return void res.writeHead(404, { "access-control-allow-origin": "*" }).end();
       res.writeHead(200, { "content-type": "application/octet-stream", "access-control-allow-origin": "*", "cache-control": "public, max-age=3600" });
       res.end(Buffer.from(b));
@@ -69,8 +84,8 @@ const server = http.createServer((req, res) => {
   if (rf) {
     const ip = realIp(req);
     if (limited(ip, "archive", 60, 60_000)) return void res.writeHead(429, { "access-control-allow-origin": "*" }).end();
-    void statsOf(rf[1]).then(
-      (j) => { res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*", "cache-control": "no-store" }); res.end(JSON.stringify(j)); },
+    void cachedJson(`ref:${rf[1]}`, 30_000, () => statsOf(rf[1])).then(
+      (body) => { res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*", "cache-control": "no-store" }); res.end(body); },
       () => { res.writeHead(502, { "access-control-allow-origin": "*" }).end(); },
     );
     return;
@@ -83,13 +98,17 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify(body));
     };
     if (limited(ip, "archive", 60, 60_000)) return void send(429, { error: "slow_down" });
-    const qs = new URL(req.url ?? "", "http://x").searchParams;
+    const qs = new URLSearchParams((req.url ?? "").split("?")[1] ?? "");
     const limit = Number(qs.get("limit") ?? 20);
     const beforeRaw = qs.get("before");
     const before = beforeRaw !== null && /^\d{10,16}$/.test(beforeRaw) ? Number(beforeRaw) : undefined;
     const modeRaw = qs.get("mode");
     const mode = modeRaw === "royale" || modeRaw === "vs" || modeRaw === "duel" ? modeRaw : undefined;
-    void recentMatches(Number.isFinite(limit) ? limit : 20, before, mode).then((j) => send(200, j), () => send(502, { error: "archive" }));
+    const lim = Number.isFinite(limit) ? limit : 20;
+    void cachedJson(`recent:${lim}:${before ?? ""}:${mode ?? ""}`, 10_000, () => recentMatches(lim, before, mode)).then(
+      (body) => { res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*", "cache-control": "public, max-age=10" }); res.end(body); },
+      () => send(502, { error: "archive" }),
+    );
     return;
   }
   // The match archive: look a match up by wallet, room, transaction or hash. Public data, read only.
@@ -103,11 +122,16 @@ const server = http.createServer((req, res) => {
     if (limited(ip, "archive", 60, 60_000)) return void send(429, { error: "slow_down" });
     void (async () => {
       try {
-        if (q[1] === "wallet") return send(200, { items: await matchesOfWallet(q[2]) });
-        if (q[1] === "tx") return send(200, { items: await matchByTx(q[2]) });
-        if (q[1] === "hash") return send(200, { items: await matchesByHash(q[2].toLowerCase()) });
-        const one = await matchById(q[2]);
-        return send(200, { items: one ? [one] : [] });
+        const key = `m:${q[1]}:${q[2]}`;
+        const body = await cachedJson(key, 10_000, async () => {
+          if (q[1] === "wallet") return { items: await matchesOfWallet(q[2]) };
+          if (q[1] === "tx") return { items: await matchByTx(q[2]) };
+          if (q[1] === "hash") return { items: await matchesByHash(q[2].toLowerCase()) };
+          const one = await matchById(q[2]);
+          return { items: one ? [one] : [] };
+        });
+        res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*", "cache-control": "no-store" });
+        return void res.end(body);
       } catch {
         send(502, { error: "archive" });
       }
@@ -134,7 +158,7 @@ wss.on("connection", (ws, req) => {
   if (open > MAX_SOCKETS_PER_IP) return void ws.close(1008, "too many connections");
   perIp.set(ip, open);
   ws.on("close", () => { const n = (perIp.get(ip) ?? 1) - 1; if (n <= 0) perIp.delete(ip); else perIp.set(ip, n); });
-  const c = hub.connect(ws);
+  const c = hub.connect(ws, ip);
   const idle = setInterval(() => {
     if (Date.now() - c.lastRefill > 60_000) ws.close();
   }, 15_000);
@@ -146,6 +170,7 @@ wss.on("connection", (ws, req) => {
   ws.on("error", () => ws.close());
 });
 
+await assertKeysSeparated();
 await startCounters();
 await startIdeas();
 startMaintenance();

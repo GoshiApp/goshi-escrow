@@ -13,6 +13,10 @@ name = "goshi_escrow_native"
 pinocchio = "0.8"
 pinocchio-system = "0.2"
 
+[features]
+# Only for the integration tests of the refund timeout: never deploy a build made with it.
+short-refund = []
+
 [profile.release]
 opt-level = "s"
 lto = "fat"

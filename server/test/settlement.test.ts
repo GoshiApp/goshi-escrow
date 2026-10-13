@@ -72,3 +72,18 @@ test("VS mode from 2 to 9 players conserves the pot and never pays a loser more 
   assert.throws(() => settleVs(SOL, ["only"]));
   assert.throws(() => settleVs(SOL, Array.from({ length: 10 }, (_, i) => `p${i}`)));
 });
+
+import { jackpotDraw } from "../src/game/settlement.ts";
+import crypto from "node:crypto";
+
+test("the jackpot draw is a pure function of the proof: the same material gives the same answer, about 1 in N", () => {
+  const secret = crypto.randomBytes(32), block = crypto.randomBytes(32);
+  assert.equal(jackpotDraw(secret, block, "1791844410630345", 100), jackpotDraw(secret, block, "1791844410630345", 100));
+  // Changing the room, the block or the secret changes the draw (over many tries it hits 1 in 100, not 0 and not always).
+  let hits = 0;
+  const n = 20_000;
+  for (let i = 0; i < n; i++) if (jackpotDraw(crypto.randomBytes(32), crypto.randomBytes(32), String(1791844410630345n + BigInt(i)), 100)) hits++;
+  assert.ok(hits > n / 100 * 0.7 && hits < n / 100 * 1.3, `hit rate ${hits}/${n}`);
+  assert.equal(jackpotDraw(secret, block, "1", 1), true);
+  assert.equal(jackpotDraw(secret, block, "1", 0), false);
+});
