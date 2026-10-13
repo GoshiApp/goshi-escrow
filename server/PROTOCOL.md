@@ -84,13 +84,13 @@ After a swap phase is enabled the operator calls `wrap_vault`, `sync_native` and
 ## The minute of frenzy (v3)
 
 Every match, in practice and in rooms, opens with a 60 second individual phase before the arena. Everybody plays the SAME map
-(same seed, same price photo), alone, and the mass collected goes into the arena (held between 20 and 90).
+(same seed, same price photo), alone, and the mass collected goes into the arena (all of it, nothing is cut).
 
 `start` carries `startsAt` = start of the ARENA and a `frenzy` object:
 `{ startsAt, ms: 60000, tickRate: 20, start: {x,y,m}, carryCap, map, snapshot, commit, signature }`.
 `map = { w, h, gems: [[id,x,y,symbol,mass,btc]], walls: [[x,y,w,h]], lasers: [[x,y,w,h,offset]], laserPeriod, laserOn, btcRespawnMs }`.
 A laser burns while `(tick + offset) % laserPeriod < laserOn`; touching it costs 25% of the mass, stuns for 1 second and leaves you where
-you were. Symbols: 0 SOL, 1 DOGE, 2 AVAX (tier 1, +1 to +2), 3 ETH, 4 BNB (tier 2, +3 to +5), 5 BTC (tier 3, +5 to +8, inside a closed
+you were. Symbols: 0 SOL, 1 DOGE, 2 AVAX (tier 1, +1 to +2), 3 ETH, 4 BNB (tier 2, +3 to +6), 5 BTC (tier 3, +12 to +24, inside a closed
 room with one timed door, back 15 seconds after it is eaten).
 
 Mass of a gem: `base * clamp((price / price_SOL)^0.35, 1, 8)`, held inside its tier range, computed once per room from the frozen photo.
@@ -111,3 +111,12 @@ Prices come from CoinGecko, then Binance (Pyth Hermes now needs an API key); `sn
 
 Landing page: `{ t: "stats", on: true }` (no wallet) subscribes to `{ t: "stats", online, playing, matches, volume, prices, solUsd }` every 2 s.
 Totals are since the server started and are not persisted yet.
+
+## Duels (private, 2 to 5 players, winner takes the pot minus 3%)
+- client -> `{ "t": "createDuel", "entryFee": "<lamports of an offered tier>", "players": 2..5 }`; server -> `{ "t": "duelCreated", "roomId", "tx", "players" }`.
+  The creator then takes a seat like in any room (join on chain). The server starts the duel when `players` seats are paid, or when the
+  creator sends `{ "t": "startDuel", "roomId" }` with at least two seated. Duels are not in the public list (`GET /duels` returns their ids).
+- On chain: instruction 12 `start_duel` (mode 2) and 13 `finalize_duel(winner 32 [, proof 128])`. The winner receives `pot - 3%`; the 3% is split
+  like every other house share. A duel nobody joins within 30 minutes is cancelled and refunded (the same expiry as any room).
+- The match is the minute of frenzy and then the arena with the zone closing from second 30. It lasts at most 10 minutes: if nobody falls, the
+  heaviest wins. Limits (tiers, players, maximum entry, per wallet caps) come from `limits.ts` and are announced in `hello.limits`.

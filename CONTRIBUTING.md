@@ -29,7 +29,7 @@ cd native && npm install && npm test # integration tests on a local validator
 cd server && npm install && npm test # server unit tests
 cd server && DEV_BOTS=1 npm run dev   # local game server (devnet)
 ```
-See server/PROTOCOL.md for the wire protocol and GO-MAINNET.md for the launch checklist.
+See server/PROTOCOL.md for the wire protocol.
 
 ## License
 By contributing you agree that your contribution is licensed under the Apache License 2.0.

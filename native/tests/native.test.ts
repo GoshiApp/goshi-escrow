@@ -266,6 +266,61 @@ describe("goshi-escrow native", () => {
     assert.equal(await getRoom(id), null);
   });
 
+  test("Duel: the winner takes the pot minus 3 percent, a loser cannot be named, more than five is refused", async () => {
+    const id = await newRoom(SOL);
+    for (let i = 0; i < 3; i++) await run([g.joinRoom(paid[i].publicKey, id)], [paid[i]]);
+    await run([g.startDuel(authority.publicKey, id)], [authority]);
+    // a wallet that is not in the room cannot win
+    await expectCode(run([g.finalizeDuel(authority.publicKey, id, infra.publicKey, liquidity.publicKey, paid[8].publicKey)], [authority]), "WinnerNotInRoom");
+    const before = await bal(paid[1].publicKey);
+    await run([g.finalizeDuel(authority.publicKey, id, infra.publicKey, liquidity.publicKey, paid[1].publicKey)], [authority]);
+    const pot = 3n * SOL;
+    assert.equal((await bal(paid[1].publicKey)) - before, pot - pct(pot, 3n));
+    assert.equal(await getRoom(id), null);
+    // six players is not a duel
+    const big = await newRoom(SOL);
+    for (let i = 0; i < 6; i++) await run([g.joinRoom(paid[i].publicKey, big)], [paid[i]]);
+    await expectCode(run([g.startDuel(authority.publicKey, big)], [authority]), "BadPlayerCount");
+    await run([g.cancelRoom(authority.publicKey, big, paid.slice(0, 6).map((p) => p.publicKey))], [authority]);
+  });
+
+  test("a private duel by contract: only the invited wallets sit, the host signs and pays, then the winner takes the pot", async () => {
+    const host = paid[0], friend = paid[1], stranger = paid[2];
+    const id = BigInt(Date.now()) * 1000n + 7n;
+    const commit = new Uint8Array(32).fill(7);
+    const before = await bal(host.publicKey);
+    await run([g.createDuel(authority.publicKey, host.publicKey, id, SOL, commit, [friend.publicKey])], [authority, host]);
+    const r = decodeRoom((await conn.getAccountInfo(g.pda.room(id)))!.data)!;
+    assert.equal(r.mode, "duel");
+    assert.equal(r.paid.length, 1);
+    assert.equal(r.paid[0].toBase58(), host.publicKey.toBase58());
+    assert.deepEqual(r.guests.map((k) => k.toBase58()), [friend.publicKey.toBase58()]);
+    assert.ok((await bal(host.publicKey)) <= before - SOL);
+    // Somebody who was not invited cannot take a seat, not as a paid player nor as a saboteur.
+    await expectCode(run([g.joinRoom(stranger.publicKey, id)], [stranger]), "Unauthorized");
+    await expectCode(run([g.joinFree(stranger.publicKey, id, await createAccount(conn, authority, mint, stranger.publicKey, Keypair.generate()))], [stranger]), "RoomNotWaiting");
+    await run([g.joinRoom(friend.publicKey, id)], [friend]);
+    await run([g.startDuel(authority.publicKey, id)], [authority]);
+    const b2 = await bal(friend.publicKey);
+    await run([g.finalizeDuel(authority.publicKey, id, infra.publicKey, liquidity.publicKey, friend.publicKey)], [authority]);
+    assert.equal((await bal(friend.publicKey)) - b2, 2n * SOL - pct(2n * SOL, 3n));
+    assert.equal(await getRoom(id), null);
+  });
+
+  test("the authority and the wallets can be rotated, and only with the right signatures", async () => {
+    const next = Keypair.generate();
+    const newInfra = Keypair.generate().publicKey;
+    // A stranger cannot change anything.
+    await expectCode(run([g.setWallets(paid[0].publicKey, newInfra, liquidity.publicKey)], [paid[0]]), "Unauthorized");
+    await run([g.setWallets(authority.publicKey, newInfra, liquidity.publicKey)], [authority]);
+    assert.equal(decodeConfig((await conn.getAccountInfo(g.pda.config))!.data)!.infraWallet.toBase58(), newInfra.toBase58());
+    await run([g.setWallets(authority.publicKey, infra.publicKey, liquidity.publicKey)], [authority]);
+    await run([g.setAuthority(authority.publicKey, next.publicKey)], [authority, next]);
+    // The old authority is out; the new one can hand it back.
+    await expectCode(run([g.setWallets(authority.publicKey, infra.publicKey, liquidity.publicKey)], [authority]), "Unauthorized");
+    await run([g.setAuthority(next.publicKey, authority.publicKey)], [authority, next]);
+  });
+
   test("a VS match needs two paid players; cancel refunds everyone", async () => {
     const id = await newRoom(SOL);
     await run([g.joinRoom(paid[6].publicKey, id)], [paid[6]]);

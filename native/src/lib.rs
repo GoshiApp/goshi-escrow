@@ -14,6 +14,12 @@
 //!   4 join_room(room_id u64)         5 join_free(room_id u64)       6 join_with_pass(room_id u64)
 //!   7 start_vs                       8 finalize_royale(podium 3 x 32 [, proof 128])
 //!   9 finalize_vs(n u8, ranking n x 32 [, proof 128])   10 cancel_room   11 withdraw_vault(amount u64)
+//!   12 start_duel (2 to 5 paid players, no free ones)
+//!   13 finalize_duel(winner 32 [, proof 128])  the winner takes the pot minus a 3 percent house fee
+//!   14 set_authority  (the current authority AND the new one both sign: a typo cannot lock the program)
+//!   15 set_wallets(infra 32, liquidity 32)  (authority only)
+//!   16 create_duel(room_id u64, entry_fee u64, seed_commit 32, n u8, guests n x 32)  the HOST signs and pays the first seat;
+//!      only the listed guests can take the other seats, so a duel is private by contract, not by a link
 //!
 //! Proof logs (no state, no rent): `create_room` logs the seed commitment, and the finalize instructions log
 //!   proof = seed_reveal 32 | blockhash 32 | price_snapshot_hash 32 | replay_root 32
@@ -45,6 +51,9 @@ pub const MAX_PAID: usize = 10;
 pub const MAX_FREE: usize = 3;
 pub const MIN_VS: usize = 2;
 pub const MAX_VS: usize = 9;
+/// A duel is a private room of 2 to 5 players where the winner takes everything but a small house fee.
+pub const MAX_DUEL: usize = 5;
+pub const DUEL_RAKE_PCT: u64 = 3;
 
 const TAG_CONFIG: u8 = 1;
 const TAG_ROOM: u8 = 2;
@@ -114,7 +123,7 @@ const C_VAULT_BUMP: usize = 139;
 const R_ID: usize = 1;
 const R_FEE: usize = 9;
 const R_STATE: usize = 17; // 0 waiting, 1 active
-const R_MODE: usize = 18; // 0 royale, 1 vs
+const R_MODE: usize = 18; // 0 royale, 1 vs, 2 duel
 const R_PAID_LEN: usize = 19;
 const R_FREE_LEN: usize = 20;
 const R_PASSES: usize = 21;
@@ -236,6 +245,14 @@ fn contains(list: &[Pubkey], n: usize, k: &Pubkey) -> bool {
     list[..n].iter().any(|x| x == k)
 }
 
+/// The invited wallets of a duel: three in the free-seat area (unused in a duel) and one in the pass-player slot.
+fn is_guest(d: &[u8], k: &Pubkey) -> bool {
+    if *k == [0u8; 32] {
+        return false;
+    }
+    (0..3).any(|i| rd_key(d, R_FREE + 32 * i) == *k) || rd_key(d, R_PASS_PLAYER) == *k
+}
+
 fn maybe_activate(d: &mut [u8], required_saboteurs: u8) {
     if d[R_PAID_LEN] as usize == MAX_PAID && d[R_FREE_LEN] >= required_saboteurs {
         d[R_STATE] = 1;
@@ -308,6 +325,30 @@ pub fn settle_vs(entry: u64, players: u64) -> Option<Vs> {
     Some(Vs { rake, burn, infra, liquidity: liq, jackpot, winner, loser })
 }
 
+pub struct Duel {
+    pub rake: u64,
+    pub burn: u64,
+    pub infra: u64,
+    pub liquidity: u64,
+    pub jackpot: u64,
+    pub winner: u64,
+}
+
+/// Winner takes all: the pot minus a 3 percent house fee, split like every other house share.
+pub fn settle_duel(entry: u64, players: u64) -> Option<Duel> {
+    if players < MIN_VS as u64 || players > MAX_DUEL as u64 {
+        return None;
+    }
+    let pot = entry.checked_mul(players)?;
+    let rake = pct(pot, DUEL_RAKE_PCT)?;
+    let winner = pot.checked_sub(rake)?;
+    let burn = pct(rake, 10)?;
+    let infra = pct(rake, 15)?;
+    let liq = pct(rake, 25)?;
+    let jackpot = rake.checked_sub(burn)?.checked_sub(infra)?.checked_sub(liq)?;
+    Some(Duel { rake, burn, infra, liquidity: liq, jackpot, winner })
+}
+
 // ───────────── entry point ─────────────
 fn process_instruction(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let (&tag, rest) = data.split_first().ok_or(ProgramError::from(E::BadInstruction))?;
@@ -324,6 +365,11 @@ fn process_instruction(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
         9 => finalize_vs(program, accounts, rest),
         10 => cancel_room(program, accounts),
         11 => withdraw_vault(program, accounts, rest),
+        12 => start_duel(program, accounts),
+        13 => finalize_duel(program, accounts, rest),
+        14 => set_authority(program, accounts),
+        15 => set_wallets(program, accounts, rest),
+        16 => create_duel(program, accounts, rest),
         _ => Err(E::BadInstruction.into()),
     }
 }
@@ -475,9 +521,13 @@ fn join_room(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
         if r[R_STATE] != 0 {
             return Err(E::RoomNotWaiting.into());
         }
+        // A duel is private by contract: only the host (already seated) and the invited wallets can take a seat.
+        if r[R_MODE] == 2 && !is_guest(&r, player.key()) {
+            return Err(E::Unauthorized.into());
+        }
         let (paid, pn) = paid_list(&r);
         let (free, fnn) = free_list(&r);
-        if pn >= MAX_PAID {
+        if pn >= MAX_PAID || (r[R_MODE] == 2 && pn >= MAX_DUEL) {
             return Err(E::RoomFull.into());
         }
         if contains(&paid, pn, player.key()) || contains(&free, fnn, player.key()) {
@@ -502,6 +552,10 @@ fn join_free(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
     }
     let (_, _, _, mint, min_hold, required) = load_config(config, program)?;
     check_room(room, program)?;
+    // Saboteur seats exist only in royale rooms (a duel keeps its invited wallets where the saboteurs would be written).
+    if room.try_borrow_data()?[R_MODE] != 0 {
+        return Err(E::RoomNotWaiting.into());
+    }
     // The token account must be a classic SPL token account of the mint, owned by the player, with enough balance.
     if !token.is_owned_by(&SPL_TOKEN_ID) || token.data_len() != 165 {
         return Err(E::NotEnoughGoshi.into());
@@ -517,7 +571,7 @@ fn join_free(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
     if rd_u64(&r, R_ID) != id {
         return Err(E::RoomMismatch.into());
     }
-    if r[R_STATE] != 0 {
+    if r[R_STATE] != 0 || r[R_MODE] != 0 {
         return Err(E::RoomNotWaiting.into());
     }
     let (paid, pn) = paid_list(&r);
@@ -583,6 +637,115 @@ fn start_vs(program: &Pubkey, a: &[AccountInfo]) -> ProgramResult {
     }
     r[R_FREE_LEN] = 0;
     r[R_MODE] = 1;
+    r[R_STATE] = 1;
+    Ok(())
+}
+
+// accounts: authority(s,w), host(s,w), config, room(w), system
+fn create_duel(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
+    let [authority, host, config, room, _system] = a else { return Err(E::BadAccounts.into()) };
+    let (auth, ..) = load_config(config, program)?;
+    require_authority(authority, &auth)?;
+    if !host.is_signer() {
+        return Err(E::Unauthorized.into());
+    }
+    if d.len() < 49 {
+        return Err(E::BadInstruction.into());
+    }
+    let id = rd_u64(d, 0);
+    let fee = rd_u64(d, 8);
+    let n = d[48] as usize;
+    if n < 1 || n > MAX_DUEL - 1 || d.len() != 49 + 32 * n {
+        return Err(E::BadPlayerCount.into());
+    }
+    if fee == 0 || fee > 1_000_000_000_000_000 {
+        return Err(E::InvalidEntryFee.into());
+    }
+    // The guests: distinct, never the host, never the zero key.
+    for i in 0..n {
+        let g = rd_key(d, 49 + 32 * i);
+        if g == [0u8; 32] || g == *host.key() {
+            return Err(E::BadInstruction.into());
+        }
+        for j in 0..i {
+            if rd_key(d, 49 + 32 * j) == g {
+                return Err(E::DuplicateWinners.into());
+            }
+        }
+    }
+    let id_bytes = id.to_le_bytes();
+    let (key, bump) = find_program_address(&[b"room", &id_bytes], program);
+    if key != *room.key() {
+        return Err(E::WrongAccount.into());
+    }
+    create_pda(authority, room, program, ROOM_LEN, &[Seed::from(b"room"), Seed::from(&id_bytes), Seed::from(&[bump])])?;
+    // The host pays the first seat in the same transaction: signing it is accepting the duel as its host.
+    Transfer { from: host, to: room, lamports: fee }.invoke()?;
+    {
+        let mut r = room.try_borrow_mut_data()?;
+        r[0] = TAG_ROOM;
+        wr_u64(&mut r, R_ID, id);
+        wr_u64(&mut r, R_FEE, fee);
+        r[R_BUMP] = bump;
+        r[R_MODE] = 2;
+        r[R_PAID..R_PAID + 32].copy_from_slice(host.key());
+        r[R_PAID_LEN] = 1;
+        for i in 0..n {
+            let g = &d[49 + 32 * i..49 + 32 * i + 32];
+            if i < 3 {
+                r[R_FREE + 32 * i..R_FREE + 32 * i + 32].copy_from_slice(g);
+            } else {
+                r[R_PASS_PLAYER..R_PASS_PLAYER + 32].copy_from_slice(g);
+            }
+        }
+    }
+    emit(b"goshi:commit", id, &[&d[16..48]]);
+    Ok(())
+}
+
+// accounts: authority(s), new_authority(s), config(w)
+fn set_authority(program: &Pubkey, a: &[AccountInfo]) -> ProgramResult {
+    let [authority, new_authority, config] = a else { return Err(E::BadAccounts.into()) };
+    let (auth, ..) = load_config(config, program)?;
+    require_authority(authority, &auth)?;
+    // The new key must sign too, so the authority can only ever be handed to a key somebody holds.
+    if !new_authority.is_signer() || *new_authority.key() == [0u8; 32] {
+        return Err(E::Unauthorized.into());
+    }
+    config.try_borrow_mut_data()?[C_AUTH..C_AUTH + 32].copy_from_slice(new_authority.key());
+    Ok(())
+}
+
+// accounts: authority(s), config(w)
+fn set_wallets(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
+    let [authority, config] = a else { return Err(E::BadAccounts.into()) };
+    let (auth, ..) = load_config(config, program)?;
+    require_authority(authority, &auth)?;
+    if d.len() < 64 || rd_key(d, 0) == [0u8; 32] || rd_key(d, 32) == [0u8; 32] {
+        return Err(E::BadInstruction.into());
+    }
+    let mut c = config.try_borrow_mut_data()?;
+    c[C_INFRA..C_INFRA + 32].copy_from_slice(&d[0..32]);
+    c[C_LIQ..C_LIQ + 32].copy_from_slice(&d[32..64]);
+    Ok(())
+}
+
+// accounts: authority(s), config, room(w)
+fn start_duel(program: &Pubkey, a: &[AccountInfo]) -> ProgramResult {
+    let [authority, config, room] = a else { return Err(E::BadAccounts.into()) };
+    let (auth, ..) = load_config(config, program)?;
+    require_authority(authority, &auth)?;
+    check_room(room, program)?;
+    let mut r = room.try_borrow_mut_data()?;
+    let n = r[R_PAID_LEN] as usize;
+    if r[R_STATE] != 0 {
+        return Err(E::RoomNotWaiting.into());
+    }
+    if n < MIN_VS || n > MAX_DUEL || r[R_PASSES] != 0 {
+        return Err(E::BadPlayerCount.into());
+    }
+    r[R_FREE_LEN] = 0;
+    r[R_MODE] = 2;
     r[R_STATE] = 1;
     Ok(())
 }
@@ -725,6 +888,46 @@ fn finalize_vs(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
     close_room(room, authority)
 }
 
+// accounts: authority(s,w), config, room(w), vault(w), infra(w), liquidity(w), winner(w)
+fn finalize_duel(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
+    if a.len() != 7 {
+        return Err(E::BadAccounts.into());
+    }
+    let (authority, config, room, vault, infra, liquidity, winner_acc) = (&a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6]);
+    let (auth, cfg_infra, cfg_liq, ..) = load_config(config, program)?;
+    require_authority(authority, &auth)?;
+    check_room(room, program)?;
+    check_vault(vault, program)?;
+    if *infra.key() != cfg_infra || *liquidity.key() != cfg_liq {
+        return Err(E::WrongAccount.into());
+    }
+    if d.len() < 32 {
+        return Err(E::BadInstruction.into());
+    }
+    let winner = rd_key(d, 0);
+    let (fee, n) = {
+        let r = room.try_borrow_data()?;
+        if r[R_STATE] != 1 || r[R_MODE] != 2 {
+            return Err(E::RoomNotActive.into());
+        }
+        let (paid, pn) = paid_list(&r);
+        if !contains(&paid, pn, &winner) {
+            return Err(E::WinnerNotInRoom.into());
+        }
+        (rd_u64(&r, R_FEE), pn as u64)
+    };
+    if *winner_acc.key() != winner || !winner_acc.is_writable() {
+        return Err(E::WrongAccount.into());
+    }
+    let s = settle_duel(fee, n).ok_or(ProgramError::from(E::MathOverflow))?;
+    move_lamports(room, winner_acc, s.winner)?;
+    pay_house(room, vault, infra, liquidity, s.infra, s.liquidity, s.burn, s.jackpot)?;
+    if d.len() >= 32 + 128 {
+        emit(b"goshi:proof", room_id_of(room)?, &[&d[32..64], &d[64..96], &d[96..128], &d[128..160]]);
+    }
+    close_room(room, authority)
+}
+
 // accounts: authority(s,w), config, room(w), then the refunded wallets (every paid player except a pass holder)
 fn cancel_room(program: &Pubkey, a: &[AccountInfo]) -> ProgramResult {
     if a.len() < 3 {
@@ -809,6 +1012,19 @@ mod tests {
         }
         let s = settle_vs(SOL, 2).unwrap();
         assert_eq!((s.loser, s.winner), (720_000_000, 1_080_000_000));
+    }
+
+    #[test]
+    fn duel_conserves_and_pays_the_winner_everything_but_the_fee() {
+        for n in 2..=5u64 {
+            let s = settle_duel(123_456_789, n).unwrap();
+            assert_eq!(s.winner + s.rake, 123_456_789 * n);
+            assert_eq!(s.burn + s.infra + s.liquidity + s.jackpot, s.rake);
+        }
+        let s = settle_duel(SOL, 2).unwrap();
+        assert_eq!((s.winner, s.rake), (1_940_000_000, 60_000_000));
+        assert!(settle_duel(SOL, 1).is_none());
+        assert!(settle_duel(SOL, 6).is_none());
     }
 
     #[test]

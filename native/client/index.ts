@@ -148,6 +148,68 @@ export class GoshiEscrow {
     );
   }
 
+  /**
+   * A private duel by contract: the host signs and pays the first seat, and only `guests` (1 to 4 wallets) can take the others.
+   * The authority pays the room's rent and signs too.
+   */
+  createDuel(authority: PublicKey, host: PublicKey, roomId: bigint | number, entryFee: bigint, commit: Uint8Array, guests: PublicKey[]) {
+    return ix(
+      this.programId,
+      [
+        { pubkey: authority, isSigner: true, isWritable: true },
+        { pubkey: host, isSigner: true, isWritable: true },
+        { pubkey: this.pda.config },
+        { pubkey: this.pda.room(roomId), isWritable: true },
+        { pubkey: SystemProgram.programId },
+      ],
+      cat(Uint8Array.of(16), u64(roomId), u64(entryFee), commit, Uint8Array.of(guests.length), ...guests.map((g) => g.toBytes()))
+    );
+  }
+
+  /** Hands the authority to another key. Both the current and the new key sign. */
+  setAuthority(authority: PublicKey, newAuthority: PublicKey) {
+    return ix(
+      this.programId,
+      [{ pubkey: authority, isSigner: true }, { pubkey: newAuthority, isSigner: true }, { pubkey: this.pda.config, isWritable: true }],
+      Uint8Array.of(14)
+    );
+  }
+
+  /** Changes the infrastructure and liquidity wallets that receive their share of the fee. */
+  setWallets(authority: PublicKey, infra: PublicKey, liquidity: PublicKey) {
+    return ix(
+      this.programId,
+      [{ pubkey: authority, isSigner: true }, { pubkey: this.pda.config, isWritable: true }],
+      cat(Uint8Array.of(15), infra.toBytes(), liquidity.toBytes())
+    );
+  }
+
+  /** A duel: 2 to 5 paid players, no saboteurs. */
+  startDuel(authority: PublicKey, roomId: bigint | number) {
+    return ix(
+      this.programId,
+      [{ pubkey: authority, isSigner: true }, { pubkey: this.pda.config }, { pubkey: this.pda.room(roomId), isWritable: true }],
+      Uint8Array.of(12)
+    );
+  }
+
+  /** The winner takes the pot minus the 3 percent house fee. */
+  finalizeDuel(authority: PublicKey, roomId: bigint | number, infra: PublicKey, liquidity: PublicKey, winner: PublicKey, proof?: Proof) {
+    return ix(
+      this.programId,
+      [
+        { pubkey: authority, isSigner: true, isWritable: true },
+        { pubkey: this.pda.config },
+        { pubkey: this.pda.room(roomId), isWritable: true },
+        { pubkey: this.pda.vault, isWritable: true },
+        { pubkey: infra, isWritable: true },
+        { pubkey: liquidity, isWritable: true },
+        { pubkey: winner, isWritable: true },
+      ],
+      cat(Uint8Array.of(13), winner.toBytes(), ...proofBytes(proof))
+    );
+  }
+
   /** `podium`: three paid wallets in rank order. `saboteurs`: the room's saboteur wallets in room order. */
   finalizeRoyale(authority: PublicKey, roomId: bigint | number, infra: PublicKey, liquidity: PublicKey, podium: PublicKey[], saboteurs: PublicKey[], proof?: Proof) {
     return ix(
@@ -237,11 +299,13 @@ export interface RoomAccount {
   roomId: bigint;
   entryFee: bigint;
   state: "waiting" | "active";
-  mode: "royale" | "vs";
+  mode: "royale" | "vs" | "duel";
   paid: PublicKey[];
   free: PublicKey[];
   passes: number;
   passPlayer: PublicKey | null;
+  /** The invited wallets of a duel (empty for any other room). */
+  guests: PublicKey[];
 }
 export function decodeRoom(d: Uint8Array): RoomAccount | null {
   if (d.length !== ROOM_LEN || d[0] !== 2) return null;
@@ -255,11 +319,14 @@ export function decodeRoom(d: Uint8Array): RoomAccount | null {
     roomId: rdU64(d, 1),
     entryFee: rdU64(d, 9),
     state: d[17] === 1 ? "active" : "waiting",
-    mode: d[18] === 1 ? "vs" : "royale",
+    mode: d[18] === 2 ? "duel" : d[18] === 1 ? "vs" : "royale",
     paid,
     free,
     passes: d[21],
     passPlayer: d[21] > 0 ? key(d, 23) : null,
+    guests: d[18] === 2
+      ? [key(d, 375), key(d, 407), key(d, 439), key(d, 23)].filter((k) => !k.equals(PublicKey.default))
+      : [],
   };
 }
 

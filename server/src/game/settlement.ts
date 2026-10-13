@@ -80,7 +80,7 @@ export type Payout =
   | { wallet: string; rank: number; kind: "goshi"; lamports: bigint };
 
 export interface Settlement {
-  mode: "royale" | "vs";
+  mode: "royale" | "vs" | "duel";
   pot: bigint;
   rake: bigint;
   rakeParts: { buybackBurn: bigint; infra: bigint; liquidity: bigint; jackpot: bigint };
@@ -109,4 +109,16 @@ export function settleVs(entry: bigint, ranking: string[]): Settlement {
   const winner = pot - rake - losersTotal;
   payouts.unshift({ wallet: ranking[0], rank: 1, kind: "sol", lamports: winner });
   return finish({ mode: "vs", pot, rake, rakeParts: rakeSplit(rake), payouts, unclaimed: 0n, unclaimedParts: { burn: 0n, jackpot: 0n } });
+}
+
+export const DUEL_RAKE_PCT = 3n;
+
+/** Duel: 2 to 5 paid players, the winner takes the pot minus the house fee. Mirrors native `settle_duel`. */
+export function settleDuel(entry: bigint, ranking: string[]): Settlement {
+  const n = BigInt(ranking.length);
+  if (n < 2n || n > 5n) throw new Error("a duel is for 2 to 5 players");
+  const pot = entry * n;
+  const rake = pct(pot, DUEL_RAKE_PCT);
+  const winner = pot - rake;
+  return finish({ mode: "duel", pot, rake, rakeParts: rakeSplit(rake), payouts: [{ wallet: ranking[0], rank: 1, kind: "sol", lamports: winner }], unclaimed: 0n, unclaimedParts: { burn: 0n, jackpot: 0n } });
 }

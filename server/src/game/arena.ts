@@ -22,6 +22,10 @@ export const ARENA = {
   boostCostPerSecond: 0.015,
   deathMass: 5,
   maxDeathOrbs: 80,
+  /** Every so often a cluster of rich coins lands inside the safe zone and pulls everybody toward it. */
+  airdropEveryS: 30,
+  airdropOrbs: 6,
+  airdropValue: 4,
 } as const;
 
 export class Rng {
@@ -83,7 +87,9 @@ export interface StepResult {
 
 // Sized like the .io snake games: a head is about 15 units wide at the start and moves about 9 radii per second.
 export const bodyRadius = (m: number) => 10 + 1.1 * Math.sqrt(m);
-export const speedOf = (m: number) => 135 / (1 + m / 300);
+export const speedOf = (m: number) => 135 / (1 + m / 600);
+/** Turn rate in radians per second: a heavy body turns wider, but never becomes a slug (a log, not a hyperbola). */
+export const turnRateOf = (m: number) => ARENA.turnRate / (1 + 0.35 * Math.log(1 + Math.max(0, m - ARENA.startMass) / 60));
 export const segmentCount = (m: number) =>
   Math.max(6, Math.min(ARENA.maxBodySegments, 6 + Math.floor(m / 3)));
 
@@ -191,6 +197,10 @@ export class Arena {
   readonly matchMs: number;
   readonly shrinkStartMs: number;
   readonly zonePlan: ZonePlan;
+  /** Every change of steering or boost of every player, as [tick, player index, angle byte, boost]. This is the match record. */
+  readonly inputLog: [number, number, number, number][] = [];
+  private stepN = 0;
+  private lastKey: number[] = [];
 
   constructor(
     seed: number,
@@ -210,11 +220,19 @@ export class Arena {
       const x = cx + Math.cos(ang) * rad;
       const y = cy + Math.sin(ang) * rad;
       const heading = Math.atan2(cy - y, cx - x);
+      // The body exists from the first tick: it lies straight behind the head, as if the player had been walking in a line.
+      const back = ARENA.maxBodySegments * Math.round(ARENA.segmentSpacing / ARENA.trailSpacing) + 6;
+      const trail: [number, number][] = [];
+      for (let k = 1; k <= back; k++) {
+        const tx = x - Math.cos(heading) * ARENA.trailSpacing * k;
+        const ty = y - Math.sin(heading) * ARENA.trailSpacing * k;
+        trail.push([Math.max(0, Math.min(ARENA.w, tx)), Math.max(0, Math.min(ARENA.h, ty))]);
+      }
       this.players.push({
         w: e.w, n: e.n, role: e.role, bot: e.bot, alive: true,
         m: ARENA.startMass, peak: ARENA.startMass,
         x, y, heading, dx: Math.cos(heading), dy: Math.sin(heading), boost: false,
-        trail: [], protectUntil: ARENA.protectSeconds, diedAt: -1, killer: "",
+        trail, protectUntil: ARENA.protectSeconds, diedAt: -1, killer: "",
       });
     });
     while (this.orbs.length < ARENA.orbTarget) this.orbs.push(this.newOrb());
@@ -227,6 +245,8 @@ export class Arena {
   zone(): Zone {
     return this.zoneNow();
   }
+
+  private nextDrop: number = ARENA.airdropEveryS;
 
   private newOrb(): Orb {
     // Uniform over the current safe zone, so loot always lies where people have to go.
@@ -286,18 +306,31 @@ export class Arena {
     const zr = zoneNow.r;
 
     // Move.
-    for (const p of this.players) {
+    const tickNo = this.stepN++;
+    for (let pi = 0; pi < this.players.length; pi++) {
+      const p = this.players[pi];
       if (!p.alive) continue;
       if (p.bot && brain) {
         const a = brain(this, p);
         p.dx = a.dx; p.dy = a.dy; p.boost = a.boost;
+      }
+      // The steering is quantized to 256 directions, so the match record (angle byte and boost) replays it exactly.
+      const TAU = Math.PI * 2;
+      const ab = Math.round((((Math.atan2(p.dy, p.dx) % TAU) + TAU) % TAU) / TAU * 256) & 255;
+      const hd = (ab / 256) * TAU;
+      p.dx = Math.cos(hd);
+      p.dy = Math.sin(hd);
+      const key = ab | (p.boost ? 256 : 0);
+      if (this.lastKey[pi] !== key) {
+        this.lastKey[pi] = key;
+        this.inputLog.push([tickNo, pi, ab, p.boost ? 1 : 0]);
       }
       const want = Math.atan2(p.dy, p.dx);
       let diff = want - p.heading;
       while (diff > Math.PI) diff -= Math.PI * 2;
       while (diff < -Math.PI) diff += Math.PI * 2;
       // Giant hunter: the heavier the body, the slower it turns, so a light player can out-maneuver a big one.
-      const maxTurn = (ARENA.turnRate / (1 + Math.max(0, p.m - ARENA.startMass) / 140)) * dt;
+      const maxTurn = turnRateOf(p.m) * dt;
       p.heading += Math.max(-maxTurn, Math.min(maxTurn, diff));
 
       let speed = speedOf(p.m);
@@ -372,10 +405,22 @@ export class Arena {
       const ra = bodyRadius(a.m);
       for (const b of this.players) {
         if (b === a || !b.alive) continue;
+        // A protected player can neither be hurt nor hurt: the same rule in both directions.
+        if (b.protectUntil > this.time) continue;
         const rb = bodyRadius(b.m);
-        const bProtected = b.protectUntil > this.time;
+        // Head against head decides alone (the body points next to a head must not turn a head-on into an unfair death):
+        // the heavier survives, equal masses both die. Handled once per pair.
+        const hx = a.x - b.x, hy = a.y - b.y;
+        if (hx * hx + hy * hy < (ra + rb) * (ra + rb)) {
+          if (a.w < b.w) {
+            if (a.m < b.m) { if (!dying.has(a.w)) dying.set(a.w, b.w); }
+            else if (b.m < a.m) { if (!dying.has(b.w)) dying.set(b.w, a.w); }
+            else { if (!dying.has(a.w)) dying.set(a.w, b.w); if (!dying.has(b.w)) dying.set(b.w, a.w); }
+          }
+          continue;
+        }
         const pts = bodies.get(b.w)!;
-        // Skip the head point (index 0): head against head is handled below.
+        // Skip the head point (index 0): head against head is handled above.
         for (let k = 1; k < pts.length; k++) {
           const ddx = a.x - pts[k][0];
           const ddy = a.y - pts[k][1];
@@ -385,21 +430,26 @@ export class Arena {
             break;
           }
         }
-        if (a.w < b.w) {
-          const hx = a.x - b.x, hy = a.y - b.y;
-          const lim = ra + rb;
-          if (hx * hx + hy * hy < lim * lim) {
-            if (bProtected) { /* a protected head cannot be hurt, and does not hurt */ }
-            else if (a.m < b.m) { if (!dying.has(a.w)) dying.set(a.w, b.w); }
-            else if (b.m < a.m) { if (!dying.has(b.w)) dying.set(b.w, a.w); }
-            else { if (!dying.has(a.w)) dying.set(a.w, b.w); if (!dying.has(b.w)) dying.set(b.w, a.w); }
-          }
-        }
       }
     }
     for (const [w, by] of dying) {
       const p = this.player(w);
       if (p) this.kill(p, by, ev);
+    }
+
+    // Airdrop: a cluster of rich coins somewhere inside the zone.
+    if (this.time >= this.nextDrop) {
+      this.nextDrop += ARENA.airdropEveryS;
+      const z = this.zone();
+      const a = this.rng.range(0, Math.PI * 2);
+      const rr = Math.sqrt(this.rng.next()) * Math.max(0, z.r - 160);
+      const cx = z.cx + Math.cos(a) * rr, cy = z.cy + Math.sin(a) * rr;
+      for (let i = 0; i < ARENA.airdropOrbs; i++) {
+        const t = this.rng.range(0, Math.PI * 2), d = this.rng.range(0, 70);
+        const o: Orb = { id: this.nextOrbId++, x: Math.round(cx + Math.cos(t) * d), y: Math.round(cy + Math.sin(t) * d), v: ARENA.airdropValue };
+        this.orbs.push(o);
+        ev.newOrbs.push(o);
+      }
     }
 
     // Keep the map stocked.

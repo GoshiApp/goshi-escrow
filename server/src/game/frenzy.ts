@@ -22,8 +22,9 @@ export const FRENZY = {
   laserPenalty: 0.25,
   stunTicks: 20,
   stunSpeed: 0.4,
-  btcRespawnTicks: 300, // 15 seconds
-  carryCap: 90,
+  btcRespawnTicks: 600, // 30 seconds
+  // No practical cap: what you collect in the minute is what you take into the arena (skill is rewarded).
+  carryCap: 10_000,
   laserPeriod: 120,
   laserOn: 60,
 } as const;
@@ -32,7 +33,7 @@ export type Sym = "SOL" | "DOGE" | "AVAX" | "ETH" | "BNB" | "BTC";
 export const SYMBOLS: readonly Sym[] = ["SOL", "DOGE", "AVAX", "ETH", "BNB", "BTC"];
 const TIERS: Record<Sym, 1 | 2 | 3> = { SOL: 1, DOGE: 1, AVAX: 1, ETH: 2, BNB: 2, BTC: 3 };
 const TIER_BASE = { 1: 1, 2: 3, 3: 5 } as const;
-const TIER_RANGE = { 1: [1, 2], 2: [3, 5], 3: [5, 8] } as const;
+const TIER_RANGE = { 1: [1, 2], 2: [3, 6], 3: [12, 24] } as const;
 export const tierOf = (s: Sym) => TIERS[s];
 
 // ───────────── price snapshot ─────────────
@@ -351,7 +352,7 @@ export function simulate(map: FrenzyMap, entries: readonly InputEntry[], ticks: 
   return p;
 }
 
-/** The mass a player carries into the arena: its frenzy mass, held between the start mass and the cap. */
+/** The mass a player carries into the arena: everything collected, never below the start mass. */
 export const carriedMass = (m: number) => round1(clamp(m, FRENZY.startMass, FRENZY.carryCap));
 
 // ───────────── a bot for the test mode ─────────────

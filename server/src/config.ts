@@ -1,3 +1,4 @@
+import { limits } from "./limits.js";
 import fs from "node:fs";
 import path from "node:path";
 import { Keypair } from "@solana/web3.js";
@@ -40,15 +41,15 @@ export const config = {
   vsOfferMs: 60_000,
   jackpotOneIn: Number(process.env.JACKPOT_ONE_IN ?? 100),
   /** Entry fees are offered in dollars and converted to SOL at the current price: from about 1 USD. */
-  feeUsd: (process.env.FEE_USD ?? "1,2.5,5,7.5,10").split(",").map(Number).filter((n) => n > 0),
+  feeUsd: process.env.FEE_USD ? process.env.FEE_USD.split(",").map(Number).filter((n) => n > 0) : limits.sol.roomTiersUsd.filter((n) => n <= limits.sol.maxEntryUsd),
   /** Pass ladder: the finished room tier (USD) maps to the tiers its top 3 can enter without paying. */
   passLadder: { 1: [7.5, 5, 2.5] } as Record<number, number[]>,
   passOfferMs: 120_000,
   maxOpenRooms: 20,
   roomsPerWalletPerHour: 3,
   allowedOrigins: [
-    "http://localhost:4321",
-    "http://127.0.0.1:4321",
+    // Local pages are accepted only off mainnet: a sign in text for "localhost" must never be valid for real funds.
+    ...(String(dc.cluster) === "mainnet-beta" ? [] : ["http://localhost:4321", "http://127.0.0.1:4321"]),
     ...(process.env.ALLOWED_ORIGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
   ],
   staleActiveMs: 15 * 60 * 1000,

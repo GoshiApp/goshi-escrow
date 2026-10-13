@@ -10,11 +10,13 @@ const snap = makeSnapshot({ ...FALLBACK_USD }, "fallback", 1_700_000_000_000);
 test("gem mass: base per tier, compressed ratio, held inside the tier range", () => {
   assert.equal(snap.mass.SOL, 1);
   assert.equal(snap.mass.DOGE, 1);
-  assert.ok(snap.mass.ETH >= 3 && snap.mass.ETH <= 5);
-  assert.ok(snap.mass.BTC >= 5 && snap.mass.BTC <= 8);
+  assert.ok(snap.mass.ETH >= 3 && snap.mass.ETH <= 6);
+  assert.ok(snap.mass.BTC >= 12 && snap.mass.BTC <= 24);
+  // The vault is worth many times a common gem: the risk has to pay.
+  assert.ok(snap.mass.BTC >= 12 * snap.mass.SOL);
   // The price never lifts a gem above its tier, and a crash never drops it below.
-  assert.equal(gemMass("BTC", { ...FALLBACK_USD, BTC: 1 }), 5);
-  assert.equal(gemMass("BTC", { ...FALLBACK_USD, BTC: 1e9 }), 8);
+  assert.equal(gemMass("BTC", { ...FALLBACK_USD, BTC: 1 }), 12);
+  assert.equal(gemMass("BTC", { ...FALLBACK_USD, BTC: 1e9 }), 24);
   assert.equal(gemMass("ETH", { ...FALLBACK_USD, ETH: 1 }), 3);
   assert.equal(gemMass("SOL", { ...FALLBACK_USD, SOL: 0 }), 1);
 });
@@ -122,5 +124,6 @@ test("a bot that follows its brain collects gems and the result is replayable", 
   assert.ok(p.m > FRENZY.startMass + 20);
   const re = simulate(map, rec.entries);
   assert.equal(re.m, p.m);
-  assert.ok(carriedMass(p.m) <= FRENZY.carryCap);
+  assert.equal(carriedMass(p.m), Math.max(FRENZY.startMass, Math.round(p.m * 10) / 10));
+  assert.equal(carriedMass(500), 500);
 });

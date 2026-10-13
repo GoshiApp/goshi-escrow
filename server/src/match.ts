@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { arenaReplayHash, encodeArenaReplay } from "./game/arena-replay.js";
 import { ARENA, Arena, ZONE_RADII, arenaBrain, bodyPoints, bodyRadius, type Orb, type Role } from "./game/arena.js";
 import {
   FRENZY, Recorder, angleByte, buildMap, carriedMass, encodeReplay, frenzyBrain, newPlayer, replayHash, stepPlayer,
@@ -10,10 +11,12 @@ export interface MatchPlayer {
   n: string;
   role: Role;
   bot: boolean;
+  /** Cosmetic skin id, already validated by the hub. */
+  skin?: string;
 }
 
 export interface MatchResult {
-  mode: "royale" | "vs";
+  mode: "royale" | "vs" | "duel";
   ranking: { w: string; rank: number; score: number; role: Role }[];
 }
 
@@ -55,7 +58,7 @@ export class Match {
 
   constructor(
     readonly roomId: string,
-    readonly mode: "royale" | "vs",
+    readonly mode: "royale" | "vs" | "duel",
     readonly players: MatchPlayer[],
     seed: number,
     matchMs: number,
@@ -82,6 +85,8 @@ export class Match {
     }
   }
   private readonly seed: number;
+  /** The mass every player enters the arena with (from the minute of frenzy), part of the match record. */
+  private arenaStartMass = new Map<string, number>();
 
   roles(): Record<string, Role> {
     return Object.fromEntries(this.players.map((p) => [p.w, p.role]));
@@ -100,6 +105,7 @@ export class Match {
       orbs: this.arena.orbs.map((o) => ({ id: o.id, x: o.x, y: o.y, v: o.v })),
       you,
       roles: this.roles(),
+      skins: Object.fromEntries(this.players.filter((p) => p.skin).map((p) => [p.w, p.skin])),
       ...(this.fmap && this.frenzyOpts
         ? {
             frenzy: {
@@ -153,6 +159,12 @@ export class Match {
       snapshotHash: this.frenzyOpts ? Buffer.from(this.frenzyOpts.snapshot.hash, "hex") : new Uint8Array(32),
       replayRoot: h.digest(),
     };
+  }
+
+  /** The size and hash of the arena match record, for the result of a practice match. */
+  arenaRecordInfo(): { hash: string; bytes: number; entries: number } | null {
+    const r = this.replays.get("arena");
+    return r ? { hash: r.hash, bytes: r.bytes.length, entries: this.arena.inputLog.length } : null;
   }
 
   replayOf(wallet: string): Uint8Array | null {
@@ -225,6 +237,7 @@ export class Match {
       if (p) {
         p.m = carriedMass(f.st.m);
         p.peak = p.m;
+        this.arenaStartMass.set(w, p.m);
       }
       if (!f.bot) {
         this.onSnap({ t: "fend", to: w, roomId: this.roomId, mass: Math.round(f.st.m * 10) / 10, carried: carriedMass(f.st.m), eaten: f.st.eaten, replay: this.replays.get(w)!.hash });
@@ -336,10 +349,22 @@ export class Match {
     if (this.timer) clearInterval(this.timer);
   }
 
+  /** Freezes the record of the whole arena phase: its hash goes into the replay root that the closing transaction logs. */
+  private sealArenaRecord() {
+    const start = this.arenaStartMass;
+    const bytes = encodeArenaReplay(
+      this.seed, this.matchMs, this.shrinkStartMs,
+      this.players.map((p) => ({ w: p.w, n: p.n, role: p.role, bot: p.bot, m: start.get(p.w) ?? ARENA.startMass })),
+      this.arena.inputLog,
+    );
+    this.replays.set("arena", { bytes, hash: arenaReplayHash(bytes) });
+  }
+
   private finish() {
     if (this.ended) return;
     this.ended = true;
     if (this.timer) clearInterval(this.timer);
+    this.sealArenaRecord();
     this.onEnd({ mode: this.mode, ranking: this.arena.ranking() });
   }
 

@@ -8,7 +8,8 @@
     "dev": "tsx src/index.ts",
     "start": "tsx src/index.ts",
     "test": "DEVNET_CONFIG=devnet-config.example.json node --import tsx --test test/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "replay-to-json": "tsx scripts/replay-to-json.ts"
   },
   "dependencies": {
     "@solana/spl-token": "^0.4.8",

@@ -9,7 +9,7 @@ RUN cd server && npm ci
 
 COPY server/src ./server/src
 COPY server/tsconfig.json ./server/tsconfig.json
-COPY devnet-config.json ./devnet-config.json
+COPY *-config.json ./
 
 ENV DEVNET_CONFIG=/app/devnet-config.json
 # The authority key is mounted from Secret Manager at run time, never baked into the image.

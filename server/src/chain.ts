@@ -8,6 +8,7 @@ import {
   mintTo,
 } from "@solana/spl-token";
 import { config, loadAuthority, log } from "./config.js";
+import { dropSecret, persistSecret } from "./secrets.js";
 import { GoshiEscrow, ROOM_LEN, decodeRoom, decodeVault, type Proof, type RoomAccount } from "./escrow-client.js";
 
 export interface ChainRoom {
@@ -15,11 +16,13 @@ export interface ChainRoom {
   pubkey: string;
   entryFee: bigint; // lamports
   state: "waiting" | "active";
-  mode: "royale" | "vs";
+  mode: "royale" | "vs" | "duel";
   paid: string[];
   free: string[];
   passes: number;
   passPlayer: string | null;
+  /** The invited wallets of a duel (empty for other rooms). */
+  guests: string[];
 }
 
 const authority = loadAuthority();
@@ -48,6 +51,7 @@ function toRoom(pubkey: PublicKey, a: RoomAccount): ChainRoom {
     free: a.free.map((p) => p.toBase58()),
     passes: a.passes,
     passPlayer: a.passPlayer ? a.passPlayer.toBase58() : null,
+    guests: a.guests.map((g) => g.toBase58()),
   };
 }
 
@@ -80,7 +84,25 @@ export async function fetchVault(): Promise<{ openBurn: bigint; openJackpot: big
 /** The secret behind each room's seed commitment, kept in memory until the room is settled. */
 const secrets = new Map<string, Buffer>();
 export const roomSecret = (roomId: string): Buffer | undefined => secrets.get(roomId);
-export const forgetSecret = (roomId: string) => void secrets.delete(roomId);
+export const forgetSecret = (roomId: string) => { secrets.delete(roomId); void dropSecret(roomId); };
+
+/**
+ * A private duel by contract. The server builds the transaction and signs it as the authority (it pays the room's rent); the host's
+ * wallet signs it and sends it, which pays the first seat and writes the invited wallets into the room. Nobody else can take a seat.
+ */
+export async function buildDuelTx(host: string, entryFee: bigint, guests: string[]): Promise<{ roomId: string; tx: string; commit: string }> {
+  const roomId = (BigInt(Date.now()) * 1000n + BigInt(Math.floor(Math.random() * 1000))).toString();
+  const secret = crypto.randomBytes(32);
+  const commit = crypto.createHash("sha256").update(secret).digest();
+  secrets.set(roomId, secret);
+  void persistSecret(roomId, secret);
+  const ix = escrow.createDuel(authority.publicKey, new PublicKey(host), BigInt(roomId), entryFee, commit, guests.map((g) => new PublicKey(g)));
+  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+  const tx = new Transaction({ feePayer: authority.publicKey, recentBlockhash: blockhash }).add(ix);
+  tx.partialSign(authority);
+  log("duel_tx_built", { roomId, host: host.slice(0, 6), guests: guests.length, entryFee: entryFee.toString() });
+  return { roomId, tx: tx.serialize({ requireAllSignatures: false }).toString("base64"), commit: commit.toString("hex") };
+}
 
 export async function createRoom(entryFee: bigint): Promise<{ roomId: string; tx: string; commit: string }> {
   const roomId = (BigInt(Date.now()) * 1000n + BigInt(Math.floor(Math.random() * 1000))).toString();
@@ -88,6 +110,7 @@ export async function createRoom(entryFee: bigint): Promise<{ roomId: string; tx
   const secret = crypto.randomBytes(32);
   const commit = crypto.createHash("sha256").update(secret).digest();
   secrets.set(roomId, secret);
+  void persistSecret(roomId, secret);
   const tx = await send([escrow.createRoom(authority.publicKey, BigInt(roomId), entryFee, commit)], authority);
   log("room_created", { roomId, entryFee: entryFee.toString(), tx, commit: commit.toString("hex") });
   return { roomId, tx, commit: commit.toString("hex") };
@@ -146,6 +169,21 @@ export async function joinFreeAs(player: Keypair, roomId: string): Promise<strin
 export async function startVs(roomId: string): Promise<string> {
   const tx = await send([escrow.startVs(authority.publicKey, BigInt(roomId))], authority);
   log("vs_started", { roomId, tx });
+  return tx;
+}
+
+export async function startDuel(roomId: string): Promise<string> {
+  const tx = await send([escrow.startDuel(authority.publicKey, BigInt(roomId))], authority);
+  log("duel_started", { roomId, tx });
+  return tx;
+}
+
+export async function finalizeDuel(roomId: string, winner: string, proof?: Proof): Promise<string> {
+  const tx = await send(
+    [escrow.finalizeDuel(authority.publicKey, BigInt(roomId), new PublicKey(config.infraWallet), new PublicKey(config.liquidityWallet), new PublicKey(winner), proof)],
+    authority
+  );
+  log("duel_finalized", { roomId, winner, tx });
   return tx;
 }
 

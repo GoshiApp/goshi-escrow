@@ -3,10 +3,21 @@ import crypto from "node:crypto";
 import nacl from "tweetnacl";
 import type WebSocket from "ws";
 import { config, log } from "./config.js";
+import { holding } from "./ideas.js";
+import { archiveMatch } from "./archive.js";
+import { accrueRoom, setReferrer } from "./referrals.js";
+import { loadSecret, markStarted } from "./secrets.js";
+import { isNewVisitorToday, noteWallet } from "./visitors.js";
+import { payPracticePrize } from "./practicePrize.js";
+import { duelTierAllowed, limits } from "./limits.js";
+import { maintenancePublic, maintenanceState, newMatchesAllowed } from "./maintenance.js";
+import { settleDuel } from "./game/settlement.js";
+import { FOUNDER_SKINS, SKIN_HOLD_USD, isFounder, isKnownSkin } from "./game/skins.js";
 import { authMessage, makeSession, newNonce, SESSION_TTL_MS, sessionSecretFrom, verifyAuth, verifySession } from "./auth.js";
-import { authority, cancelRoom, createRoom, currentBlockhash, fetchRoom, finalizeRoyale, finalizeVs, forgetSecret, joinWithPass, listRooms, roomSecret, startVs, type ChainRoom } from "./chain.js";
+import { authority, cancelRoom, createRoom, currentBlockhash, fetchRoom, finalizeDuel, finalizeRoyale, buildDuelTx, finalizeVs, forgetSecret, startDuel, joinWithPass, listRooms, roomSecret, startVs, type ChainRoom } from "./chain.js";
 import { Match, type FrenzyOptions, type MatchResult } from "./match.js";
 import { latestSnapshot, takeSnapshot } from "./snapshot.js";
+import { addMatch, addVisit, counts } from "./counters.js";
 import { settleRoyale, settleVs } from "./game/settlement.js";
 import { faucet, fillWithBots, isBot } from "./devbots.js";
 import { feeAllowed, feeOfTier, feeOptions, refreshPrice, solPriceUsd, tierUsdOf } from "./price.js";
@@ -22,10 +33,13 @@ export interface Client {
   lastRefill: number;
   /** Asked for the live numbers of the landing page. */
   watchStats?: boolean;
+  visitCounted?: boolean;
+  /** The random browser id (never an address): lets several tabs of one browser count as one person. */
+  vid?: string;
 }
 
 interface Pending {
-  mode: "royale" | "vs";
+  mode: "royale" | "vs" | "duel";
   result: MatchResult;
   payout: any;
   jackpotWinner: string | null;
@@ -86,12 +100,20 @@ export class Hub extends EventEmitter {
   readonly clients = new Set<Client>();
   readonly rooms = new Map<string, Entry>();
   private created = new Map<string, number[]>();
+  /** Wallet -> cosmetic skin id (validated), used when a room starts. */
+  private skinOf = new Map<string, string>();
+  /** Private duels waiting or running: room id -> creator and size. Persisted so a restart does not forget them. */
+  private duelMeta = new Map<string, { creator: string; max: number; at?: number }>();
+  /** Invitations already shown to each connection, so a duel is announced once. */
+  private invited = new WeakMap<Client, Set<string>>();
+  private duelChecked = new Set<string>();
   /** Pass offers: wallet -> the room it may enter for free and until when. */
   private offers = new Map<string, { roomId: string; expires: number; tierUsd: number; rank: number }>();
   private timer?: ReturnType<typeof setInterval>;
   private polling = false;
-  /** Totals since the server started (not persisted yet) and the replays of the last matches, for the replay endpoint. */
-  readonly stats = { matches: 0, volume: 0n };
+  /** At most 5 visits a second are counted (refilled every second): a script cannot inflate the number. */
+  private visitBudget = 5;
+  /** The replays of the last matches, for the replay endpoint. Totals live in counters.ts (persistent). */
   private replayStore = new Map<string, Map<string, Uint8Array>>();
 
   private keepReplays(roomId: string, match: Match) {
@@ -110,21 +132,42 @@ export class Hub extends EventEmitter {
 
   /** What the landing page shows: people connected, people in a match, matches, volume and the prices of the gems. */
   statsMsg() {
-    let playing = 0;
-    for (const c of this.clients) if (c.entered || c.practice) playing++;
+    // People, not sockets: a browser with three tabs is one person, and the team's own browsers (no id, founder wallet) are not counted.
+    const key = (c: Client): string | null => c.vid ?? (c.wallet && !isFounder(c.wallet) && !isBot(c.wallet) ? `w:${c.wallet}` : null);
+    const online = new Set<string>();
+    const playingSet = new Set<string>();
+    for (const c of this.clients) {
+      const k = key(c);
+      if (!k) continue;
+      online.add(k);
+      if (c.entered || c.practice) playingSet.add(k);
+    }
+    const playing = playingSet.size;
     const snap = latestSnapshot();
+    const totals = counts();
     return {
       t: "stats",
-      online: this.clients.size,
+      online: online.size,
       playing,
-      matches: this.stats.matches,
-      volume: this.stats.volume.toString(),
+      visits: totals.visits,
+      matches: totals.matches,
+      volume: totals.volume.toString(),
       prices: snap ? { source: snap.source, at: snap.at, usd: snap.usd, mass: snap.mass } : null,
       solUsd: solPriceUsd(),
+      wallets: counts().wallets,
+      maintenance: maintenancePublic(),
     };
   }
 
+  /** Money matches being played right now (a deploy waits for zero). Practice matches do not count. */
+  matchesRunning(): number {
+    let n = 0;
+    for (const e of this.rooms.values()) if (e.match && !e.match.ended) n++;
+    return n;
+  }
+
   start() {
+    setInterval(() => { this.visitBudget = 5; }, 1000);
     setInterval(() => {
       const m = this.statsMsg();
       for (const c of this.clients) if (c.watchStats) send(c, m);
@@ -157,6 +200,19 @@ export class Hub extends EventEmitter {
       feePresets: feeOptions().map((o) => o.lamports.toString()),
       feeOptions: feeOptions().map((o) => ({ lamports: o.lamports.toString(), usd: o.usd })),
       solUsd: solPriceUsd(),
+      maintenance: maintenancePublic(),
+      limits: {
+        stage: limits.stage,
+        maxEntryUsd: limits.sol.maxEntryUsd,
+        goshi: { enabled: limits.goshi.enabled },
+        duel: {
+          tiers: feeOptions().filter((o) => duelTierAllowed(o.usd)).map((o) => ({ lamports: o.lamports.toString(), usd: o.usd })),
+          players: limits.sol.duelPlayers,
+          rakePct: limits.duel.rakePct,
+          maxMinutes: limits.duel.maxMinutes,
+          joinWindowMinutes: limits.duel.joinWindowMinutes,
+        },
+      },
       minHolder: config.minHolder.toString(),
       rules: {
         matchMs: config.matchMs,
@@ -194,8 +250,16 @@ export class Hub extends EventEmitter {
     if (msg.t === "ping") return send(c, { t: "pong" });
     // Free practice needs no wallet and moves no money.
     if (msg.t === "stats") {
+      // A visit is one load of a page by one browser tab session (the page sends `visit` once). Only a number is kept.
+      if (msg.visit === true && !c.visitCounted && this.visitBudget > 0) {
+        c.visitCounted = true;
+        this.visitBudget--;
+        // One visitor per day: a random browser id, kept only as a salted hash for the day. The team's own browsers send no id.
+        if (isNewVisitorToday(msg.vid)) addVisit();
+      }
+      if (typeof msg.vid === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(msg.vid)) c.vid = msg.vid;
       c.watchStats = msg.on !== false;
-      if (c.watchStats) send(c, this.statsMsg());
+      if (c.watchStats) send(c, { ...this.statsMsg(), counted: c.visitCounted === true });
       return;
     }
     if (msg.t === "practice") return this.onPractice(c, msg);
@@ -214,12 +278,16 @@ export class Hub extends EventEmitter {
       const known = verifySession(msg.token, SESSION_SECRET);
       if (known && (msg.wallet === undefined || msg.wallet === known)) {
         c.wallet = known;
+        if (typeof msg.vid === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(msg.vid)) c.vid = msg.vid;
+        void noteWallet(known, isBot(known));
         const s = makeSession(known, SESSION_SECRET);
         return send(c, { t: "authed", wallet: known, session: s.token, expiresAt: s.expiresAt, viaToken: true });
       }
       if (typeof msg.wallet === "string" && typeof msg.signature === "string" && verifyAuth(msg.wallet, c.nonce, msg.signature, typeof msg.message === "string" ? msg.message : undefined, AUTH_HOSTS)) {
         const w: string = msg.wallet;
         c.wallet = w;
+        if (typeof msg.vid === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(msg.vid)) c.vid = msg.vid;
+        void noteWallet(w, isBot(w));
         const s = makeSession(w, SESSION_SECRET);
         return send(c, { t: "authed", wallet: w, session: s.token, expiresAt: s.expiresAt });
       }
@@ -245,6 +313,17 @@ export class Hub extends EventEmitter {
           return await this.onEnter(c, String(msg.roomId));
         case "vs":
           return this.onVs(c, String(msg.roomId), !!msg.accept);
+        case "ref": {
+          const r = String(msg.ref ?? "");
+          if (c.wallet && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(r)) void setReferrer(c.wallet, r);
+          return;
+        }
+        case "createDuel":
+          return void (await this.onCreateDuel(c, msg));
+        case "startDuel":
+          return void (await this.onStartDuel(c, String(msg.roomId)));
+        case "skin":
+          return void (await this.onSkin(c, msg));
         case "input":
           return this.onInput(c, msg);
         case "leave":
@@ -266,9 +345,11 @@ export class Hub extends EventEmitter {
       c.practice.match.stop();
       c.practice = undefined;
     }
+    if (maintenanceState() === "down") return err(c, "maintenance", "Scheduled maintenance: practice is closed until it ends.");
     const running = [...this.clients].filter((x) => x.practice).length;
     if (running >= config.maxPractice) return err(c, "busy", "Practice is full right now, try again in a minute.");
     const you = `you_${crypto.randomBytes(6).toString("hex")}`;
+    const prizeWallet = typeof msg.wallet === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(msg.wallet) ? msg.wallet : null;
     const raw = typeof msg.name === "string" ? msg.name.replace(/[^\p{L}\p{N} _-]/gu, "").slice(0, 14).trim() : "";
     const roster = [
       { w: you, n: raw || "You", role: "paid" as const, bot: false },
@@ -289,17 +370,23 @@ export class Hub extends EventEmitter {
       config.practiceMs,
       Date.now() + 2500,
       (snap) => send(c, snap),
-      (res) => {
+      async (res) => {
+        // A connected wallet that finishes in the top three of a practice match is paid test SOL (devnet only).
+        const place = res.ranking.find((r) => r.w === you)?.rank ?? 0;
+        const prize = prizeWallet && place > 0 ? await payPracticePrize(prizeWallet, place) : null;
         send(c, {
           t: "end",
           roomId: id,
           mode: "royale",
           practice: true,
+          ...(prize ? { prize } : {}),
           ranking: res.ranking,
           payout: { pot: "0", rake: "0", podium: [], unclaimed: "0", jackpot: { triggered: false, amount: "0", winner: null } },
           tx: null,
           error: null,
+          record: match.arenaRecordInfo() ?? undefined,
         });
+        this.keepReplays(id, match);
         c.practice = undefined;
       },
       config.practiceShrinkStartMs,
@@ -312,8 +399,27 @@ export class Hub extends EventEmitter {
     log("practice_started", { id });
   }
 
+  /** The cosmetic skin a signed in wallet wears in paid rooms. A holder skin needs the balance on chain. */
+  private async onSkin(c: Client, msg: any) {
+    if (!c.wallet) return;
+    const id = msg.id;
+    if (!isKnownSkin(id)) return void this.skinOf.delete(c.wallet);
+    if (FOUNDER_SKINS.includes(id) && !isFounder(c.wallet)) return void this.skinOf.delete(c.wallet);
+    const need = SKIN_HOLD_USD[id];
+    if (need !== undefined) {
+      try {
+        const h = await holding(c.wallet);
+        if (!h.price || h.usd < need) return void this.skinOf.delete(c.wallet);
+      } catch {
+        return;
+      }
+    }
+    this.skinOf.set(c.wallet, id);
+  }
+
   private async onCreateRoom(c: Client, msg: any) {
     if (config.paused) return err(c, "paused", "New rooms are paused for now.");
+    if (!newMatchesAllowed()) return err(c, "maintenance", "Scheduled maintenance: new rooms are closed until it ends.");
     let fee: bigint;
     try {
       fee = BigInt(msg.entryFee);
@@ -335,9 +441,64 @@ export class Hub extends EventEmitter {
     void this.poll();
   }
 
+  /**
+   * A private duel by contract: the host names 1 to 4 wallets, the server builds a transaction that the host's wallet signs, and
+   * the program only lets those wallets take a seat. The winner takes the pot minus a small fee.
+   */
+  private async onCreateDuel(c: Client, msg: any) {
+    if (config.paused) return err(c, "paused", "New rooms are paused for now.");
+    if (!newMatchesAllowed()) return err(c, "maintenance", "Scheduled maintenance: new duels are closed until it ends.");
+    let fee: bigint;
+    try {
+      fee = BigInt(msg.entryFee);
+    } catch {
+      return err(c, "bad_fee", "The entry fee is not valid.");
+    }
+    if (!duelTierAllowed(tierUsdOf(fee)) || !feeAllowed(fee)) return err(c, "bad_fee", "That entry fee is not offered for duels.");
+    const me = c.wallet!;
+    const raw: unknown[] = Array.isArray(msg.guests) ? msg.guests : [];
+    const guests: string[] = [];
+    for (const g of raw) {
+      const w = String(g).trim();
+      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(w)) return err(c, "bad_guest", "One of the addresses is not a valid wallet.");
+      if (w === me || guests.includes(w)) return err(c, "bad_guest", "Invite each wallet once, and not yourself.");
+      guests.push(w);
+    }
+    const [minP, maxP] = limits.sol.duelPlayers;
+    if (guests.length < minP - 1 || guests.length > maxP - 1) return err(c, "bad_players", `Invite from ${minP - 1} to ${maxP - 1} wallets.`);
+    const open = [...this.duelMeta].filter(([id, m]) => m.creator === me && this.rooms.get(id)?.chain.state === "waiting").length;
+    if (open >= limits.sol.maxOpenDuelsPerWallet) return err(c, "too_many_duels", "You have too many open duels.");
+    const hourAgo = Date.now() - 3600_000;
+    const mine = (this.created.get(me) ?? []).filter((t) => t > hourAgo);
+    if (mine.length >= limits.sol.maxDuelsPerWalletPerHour) return err(c, "rate_limited", "Too many duels created, try again later.");
+    const openAll = [...this.rooms.values()].filter((e) => e.chain.state === "waiting").length;
+    if (openAll >= config.maxOpenRooms) return err(c, "too_many_rooms", "Too many open rooms right now.");
+    mine.push(Date.now());
+    this.created.set(me, mine);
+    const { roomId, tx } = await buildDuelTx(me, fee, guests);
+    this.duelMeta.set(roomId, { creator: me, max: guests.length + 1, at: Date.now() });
+    void persistDuel(roomId, me, guests.length + 1);
+    send(c, { t: "duelTx", roomId, tx, players: guests.length + 1, guests });
+  }
+
+  private async onStartDuel(c: Client, roomId: string) {
+    const e = await this.entryFor(roomId);
+    if (!e || !this.duelMeta.has(roomId)) return err(c, "no_room", "That duel does not exist.");
+    if (this.duelMeta.get(roomId)!.creator !== c.wallet) return err(c, "not_creator", "Only who made the duel can start it early.");
+    if (e.chain.state !== "waiting" || e.chain.paid.length < limits.sol.duelPlayers[0]) return err(c, "not_ready", "The duel needs at least two players.");
+    try {
+      await startDuel(roomId);
+    } catch (ex: any) {
+      log("duel_start_failed", { roomId, error: String(ex?.message ?? ex).slice(0, 160) });
+      return err(c, "start_failed", "The duel could not start, try again.");
+    }
+    void this.poll();
+  }
+
   /** Quick match: the fullest waiting room with this fee and a free paid seat, or a new one. The web then takes the seat. */
   private async onQuick(c: Client, msg: any) {
     if (config.paused) return err(c, "paused", "New rooms are paused for now.");
+    if (!newMatchesAllowed()) return err(c, "maintenance", "Scheduled maintenance: new rooms are closed until it ends.");
     let fee: bigint;
     try {
       fee = BigInt(msg.entryFee);
@@ -348,7 +509,7 @@ export class Hub extends EventEmitter {
     const me = c.wallet!;
     const candidates = [...this.rooms.values()]
       .map((e) => e.chain)
-      .filter((r) => r.state === "waiting" && r.mode === "royale" && r.entryFee === fee && r.paid.length < config.paidSlots && !r.paid.includes(me) && !r.free.includes(me))
+      .filter((r) => r.state === "waiting" && r.mode === "royale" && !this.duelMeta.has(r.id) && r.entryFee === fee && r.paid.length < config.paidSlots && !r.paid.includes(me) && !r.free.includes(me))
       .sort((a, b) => b.paid.length - a.paid.length);
     if (candidates.length > 0) {
       return send(c, { t: "quickRoom", roomId: candidates[0].id, created: false, paid: candidates[0].paid.length });
@@ -391,6 +552,7 @@ export class Hub extends EventEmitter {
       const code = String(e?.message ?? "");
       if (code === "faucet_rate_limited") return err(c, code, "The faucet can be used once every 10 minutes.");
       if (code === "faucet_enough_tokens") return err(c, code, "You already hold enough test funds.");
+      if (code === "faucet_empty") return err(c, code, "The test faucet is empty right now. Get devnet SOL at faucet.solana.com and try again.");
       throw e;
     }
   }
@@ -420,6 +582,17 @@ export class Hub extends EventEmitter {
     const chain = e?.chain ?? (await fetchRoom(roomId));
     const w = c.wallet!;
     const role = chain?.paid.includes(w) ? "paid" : chain?.free.includes(w) ? "saboteur" : null;
+    // Anyone can watch a duel that is being played (it is a public match); only the seated can steer.
+    if (chain && !role && chain.mode === "duel" && chain.state === "active") {
+      c.watching.add(roomId);
+      e?.watchers.add(c);
+      send(c, { t: "entered", roomId, role: "paid", spectator: true });
+      if (e) {
+        send(c, this.lobbyMsg(e));
+        if (e.match && !e.match.ended) send(c, e.match.startMsg(w));
+      }
+      return;
+    }
     if (!chain || !role) return err(c, "not_in_room", "Join the room on-chain first.");
     c.entered = roomId;
     c.watching.add(roomId);
@@ -468,12 +641,29 @@ export class Hub extends EventEmitter {
       paid: e.chain.paid,
       free: e.chain.free,
       waitedMs: Date.now() - e.firstSeen,
+      ...(this.duelMeta.has(e.chain.id) ? { duel: this.duelMeta.get(e.chain.id) } : {}),
     };
   }
 
   private broadcast(e: Entry, msg: object) {
     const to = (msg as { to?: string }).to;
     for (const c of e.watchers) if (to === undefined || c.wallet === to) send(c, msg);
+  }
+
+  /** Duels that are being played now: anybody may watch them. */
+  liveDuels(): { roomId: string; entryFee: string; players: string[] }[] {
+    const out: { roomId: string; entryFee: string; players: string[] }[] = [];
+    for (const e of this.rooms.values()) {
+      if (e.chain.mode === "duel" && e.chain.state === "active" && e.match && !e.match.ended) {
+        out.push({ roomId: e.chain.id, entryFee: e.chain.entryFee.toString(), players: e.chain.paid });
+      }
+    }
+    return out;
+  }
+
+  /** Ids of the private duels that are waiting for players (kept out of the public room list). */
+  duelIds(): string[] {
+    return [...this.duelMeta.keys()].filter((id) => this.rooms.get(id)?.chain.state !== "active");
   }
 
   async poll() {
@@ -490,16 +680,41 @@ export class Hub extends EventEmitter {
           this.rooms.set(r.id, e);
         }
         e.chain = r;
+        if (!this.duelMeta.has(r.id) && !this.duelChecked.has(r.id) && r.state === "waiting") {
+          this.duelChecked.add(r.id);
+          const m = await loadDuel(r.id);
+          if (m) this.duelMeta.set(r.id, m);
+        }
         const key = `${r.state}:${r.mode}:${r.paid.length}:${r.free.length}`;
         if (key !== e.lastLobby) {
           e.lastLobby = key;
           this.broadcast(e, this.lobbyMsg(e));
         }
+        if (r.state === "waiting" && !newMatchesAllowed() && (await this.drain(e))) continue;
         if (r.state === "waiting" && (await this.expire(e))) continue;
-        if (r.state === "waiting") await this.vsFallback(e);
+        // The contract is the source of truth for a duel: who hosts it and how many are invited.
+        if (r.guests.length > 0 && !this.duelMeta.has(r.id) && r.paid.length > 0) this.duelMeta.set(r.id, { creator: r.paid[0], max: r.guests.length + 1 });
+        const dm = this.duelMeta.get(r.id);
+        if (r.mode === "duel" && r.state === "waiting" && r.guests.length > 0) {
+          for (const c of this.clients) {
+            if (!c.wallet || !r.guests.includes(c.wallet) || r.paid.includes(c.wallet)) continue;
+            const shown = this.invited.get(c) ?? new Set<string>();
+            if (shown.has(r.id)) continue;
+            shown.add(r.id);
+            this.invited.set(c, shown);
+            send(c, { t: "invite", roomId: r.id, entryFee: r.entryFee.toString(), host: r.paid[0] ?? "", players: r.guests.length + 1 });
+          }
+        }
+        if (r.state === "waiting" && dm) {
+          if (r.paid.length >= dm.max && !e.starting) {
+            try { await startDuel(r.id); } catch (ex: any) { log("duel_start_failed", { roomId: r.id, error: String(ex?.message ?? ex).slice(0, 160) }); }
+          }
+        } else if (r.state === "waiting") await this.vsFallback(e);
         if (r.state === "active" && !e.match && !e.starting && !e.pending) await this.startMatch(e);
         await this.recover(e);
       }
+      // A duel whose transaction was never signed (the host closed the page) leaves no room: forget it after ten minutes.
+      for (const [id, m] of [...this.duelMeta]) if (!seen.has(id) && m.at && Date.now() - m.at > 600_000) this.duelMeta.delete(id);
       for (const id of [...this.rooms.keys()]) {
         const e = this.rooms.get(id)!;
         if (!seen.has(id) && !(e.match && !e.match.ended)) this.rooms.delete(id);
@@ -541,23 +756,43 @@ export class Hub extends EventEmitter {
   private async startMatch(e: Entry) {
     e.starting = true;
     const players = [
-      ...e.chain.paid.map((w) => ({ w, n: short(w), role: "paid" as const, bot: isBot(w) })),
-      ...e.chain.free.map((w) => ({ w, n: short(w), role: "saboteur" as const, bot: isBot(w) })),
+      ...e.chain.paid.map((w) => ({ w, n: short(w), role: "paid" as const, bot: isBot(w), skin: this.skinOf.get(w) })),
+      ...e.chain.free.map((w) => ({ w, n: short(w), role: "saboteur" as const, bot: isBot(w), skin: this.skinOf.get(w) })),
     ];
     const roomId = e.chain.id;
-    const fz = await frenzyFor(roomId, roomSecret(roomId));
+    // The match must use the secret that was committed on chain. After a restart it comes back from storage; a match that was
+    // already running when the server stopped, or a room whose secret is gone, is refunded instead of being replayed.
+    let known = roomSecret(roomId);
+    const stored = await loadSecret(roomId);
+    if (!known && stored.secret) known = stored.secret;
+    if (stored.started || !known) {
+      log("room_refunded_lost_match", { roomId, started: stored.started, hadSecret: !!known });
+      try {
+        await cancelRoom(roomId, e.chain.paid, e.chain.passPlayer);
+        this.broadcast(e, { t: "error", code: "match_lost", message: "The server restarted during this match, so it was cancelled and every entry refunded." });
+        this.rooms.delete(roomId);
+        forgetSecret(roomId);
+      } catch (ex: any) {
+        e.starting = false;
+        log("room_refund_failed", { roomId, error: String(ex?.message ?? ex).slice(0, 160) });
+      }
+      return;
+    }
+    void markStarted(roomId);
+    const fz = await frenzyFor(roomId, known);
     e.seedParts = { secret: fz.secret, blockhash: fz.blockhash };
     const startsAt = Date.now() + config.countdownMs;
+    const isDuel = e.chain.mode === "duel";
     const match = new Match(
       roomId,
       e.chain.mode,
       players,
       fz.seed,
-      config.matchMs,
+      isDuel ? limits.duel.maxMinutes * 60_000 : config.matchMs,
       startsAt,
       (snap) => this.broadcast(e, snap),
       (res) => void this.settle(e, res),
-      undefined,
+      isDuel ? 30_000 : undefined,
       fz.opts,
     );
     e.match = match;
@@ -593,6 +828,16 @@ export class Hub extends EventEmitter {
         jackpotWinner = top[0]?.w ?? null;
         log("jackpot_event", { roomId: chain.id, winner: jackpotWinner });
       }
+    } else if (res.mode === "duel") {
+      const ranking = res.ranking.map((r) => r.w);
+      const s = settleDuel(entry, ranking);
+      payout = {
+        pot: s.pot.toString(),
+        rake: s.rake.toString(),
+        podium: s.payouts.map((p) => ({ w: p.wallet, rank: p.rank, kind: p.kind, lamports: p.lamports.toString() })),
+        unclaimed: "0",
+        jackpot: { triggered: false, amount: "0", winner: null },
+      };
     } else {
       const ranking = res.ranking.map((r) => r.w);
       const s = settleVs(entry, ranking);
@@ -630,6 +875,8 @@ export class Hub extends EventEmitter {
             e.chain.free,
             this.proofOf(e),
           );
+        } else if (p.mode === "duel") {
+          tx = await finalizeDuel(roomId, p.result.ranking[0].w, this.proofOf(e));
         } else {
           tx = await finalizeVs(roomId, p.result.ranking.map((r) => r.w), this.proofOf(e));
         }
@@ -665,13 +912,21 @@ export class Hub extends EventEmitter {
             }
           : undefined,
     };
+    if (tx && e.match) this.keepReplays(roomId, e.match);
     this.broadcast(e, msg);
     this.emit("ended", msg);
     if (tx) {
       if (e.match) {
         this.keepReplays(roomId, e.match);
-        this.stats.matches++;
-        this.stats.volume += e.chain.entryFee * BigInt(e.chain.paid.length - e.chain.passes);
+        const rep = this.replayStore.get(roomId) ?? new Map<string, Uint8Array>();
+        void accrueRoom(roomId, e.chain.paid.filter((w) => !isBot(w)), e.chain.entryFee * BigInt(e.chain.paid.length - e.chain.passes));
+        void archiveMatch({
+          roomId, at: Date.now(), mode: p.mode, cluster: config.cluster, tx, entryFee: e.chain.entryFee.toString(),
+          wallets: [...e.chain.paid, ...e.chain.free].filter((w) => !isBot(w)),
+          hashes: [...(msg.proof?.replays ?? []).map((r: { hash: string }) => r.hash), ...(msg.proof ? [msg.proof.commit, msg.proof.snapshot.hash] : [])],
+          ranking: p.result.ranking, payout: p.payout, proof: msg.proof,
+        }, rep);
+        addMatch(e.chain.entryFee * BigInt(e.chain.paid.length - e.chain.passes));
       }
       forgetSecret(roomId);
       if (p.mode === "royale") this.offerPasses(e, p.result.ranking.filter((r) => r.role === "paid").slice(0, 3).map((r) => r.w));
@@ -734,6 +989,21 @@ export class Hub extends EventEmitter {
    * A waiting room that nobody filled is not kept forever: after `roomTtlMs` from its creation (the room id carries the
    * creation time in milliseconds) it is closed on the chain, every paid entry goes back and the rent returns to the platform.
    */
+  /** During the maintenance guard a room that has not started is cancelled and every entry is refunded. */
+  private async drain(e: Entry): Promise<boolean> {
+    if (e.offer || e.match || e.pending || e.chain.state !== "waiting") return false;
+    try {
+      await cancelRoom(e.chain.id, e.chain.paid, e.chain.passPlayer);
+      this.broadcast(e, { t: "error", code: "maintenance_refund", message: "Scheduled maintenance is about to start: this room was cancelled and every entry refunded." });
+      this.rooms.delete(e.chain.id);
+      log("room_drained", { roomId: e.chain.id, paid: e.chain.paid.length });
+      return true;
+    } catch (ex: any) {
+      log("room_drain_failed", { roomId: e.chain.id, error: String(ex?.message ?? ex).slice(0, 160) });
+      return false;
+    }
+  }
+
   private async expire(e: Entry): Promise<boolean> {
     if (e.offer || e.match || e.pending || e.chain.state !== "waiting") return false;
     const createdMs = Math.floor(Number(BigInt(e.chain.id) / 1000n));
@@ -765,5 +1035,34 @@ export class Hub extends EventEmitter {
     } else if (Date.now() - p.since > 20_000 && p.attempts < 20) {
       await this.trySettle(e);
     }
+  }
+}
+
+// ───────────── duel metadata persistence (Firestore, like the counters) ─────────────
+import { firestoreBase as fsBase, firestoreReady as fsReady, firestoreToken as fsToken } from "./counters.js";
+
+async function persistDuel(roomId: string, creator: string, max: number): Promise<void> {
+  if (!fsReady()) return;
+  try {
+    await fetch(`${fsBase()}/duels/${encodeURIComponent(roomId)}`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${await fsToken()}`, "content-type": "application/json" },
+      body: JSON.stringify({ fields: { creator: { stringValue: creator }, max: { integerValue: String(max) }, at: { integerValue: String(Date.now()) } } }),
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch { /* the duel still works from memory until a restart */ }
+}
+
+async function loadDuel(roomId: string): Promise<{ creator: string; max: number } | null> {
+  if (!fsReady()) return null;
+  try {
+    const r = await fetch(`${fsBase()}/duels/${encodeURIComponent(roomId)}`, { headers: { authorization: `Bearer ${await fsToken()}` }, signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return null;
+    const f = (await r.json()).fields ?? {};
+    const creator = String(f.creator?.stringValue ?? "");
+    const max = Number(f.max?.integerValue ?? 0);
+    return creator && max >= 2 ? { creator, max } : null;
+  } catch {
+    return null;
   }
 }

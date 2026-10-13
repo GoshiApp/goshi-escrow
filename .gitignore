@@ -11,3 +11,4 @@ test-ledger
 .v1-program-keypair.json
 .v2-program-keypair.json
 .mainnet-rpc.txt
+.admin-token
