@@ -8,7 +8,7 @@
 //   draining  inside the guard: nothing new starts, running matches finish
 //   down      inside the window: no matches, no new anything (practice too)
 // The window is kept in Firestore so it survives restarts and every instance agrees. Set it with scripts/maintenance.sh.
-import { log } from "./config.js";
+import { log, netName } from "./config.js";
 import { firestoreBase, firestoreReady, firestoreToken } from "./counters.js";
 
 export interface Window { startsAt: number; endsAt: number; message: string }
@@ -16,7 +16,7 @@ export type MaintState = "none" | "soon" | "draining" | "down";
 
 /** Longest match (a duel: a minute of frenzy, a gap, ten minutes) plus time to settle on chain. */
 export const GUARD_MS = Number(process.env.MAINT_GUARD_MS ?? 15 * 60_000);
-const DOC = "config/maintenance";
+const DOC = `config/${netName("maintenance")}`;
 let current: Window | null = null;
 
 export const maintenanceWindow = (): Window | null => current;

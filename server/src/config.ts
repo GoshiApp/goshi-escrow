@@ -24,6 +24,14 @@ export const config = {
   /** $GOSHI base units a wallet must hold to take a saboteur seat. The authority sets the same value on-chain. */
   minHolder: BigInt(process.env.MIN_HOLDER ?? dc.minHolder ?? "100000000"),
   devBots: process.env.DEV_BOTS === "1",
+  /** ROOMS=0: a server of another region that only runs practice and the live arena; the rooms with entries (on chain) are run by
+   *  one server only, so two servers never act on the same room. */
+  rooms: process.env.ROOMS !== "0",
+  /** Several regions can run rooms with entries at once: each server runs only the rooms whose id leaves this remainder when
+   *  divided by REGION_COUNT, and it creates its own rooms with that remainder. So two servers never act on the same room, and
+   *  anybody can tell which server runs a room from its id alone. */
+  regionSlot: Number(process.env.REGION_SLOT ?? 0),
+  regionCount: Math.max(1, Number(process.env.REGION_COUNT ?? 1)),
   /** Kill switch: PAUSED=1 refuses new rooms (running matches still finish and pay out). */
   paused: process.env.PAUSED === "1",
   // Rules (server/PROTOCOL.md).
@@ -45,7 +53,8 @@ export const config = {
   /** Pass ladder: the finished room tier (USD) maps to the tiers its top 3 can enter without paying. */
   passLadder: { 1: [7.5, 5, 2.5] } as Record<number, number[]>,
   passOfferMs: 120_000,
-  maxOpenRooms: 20,
+  // Each open room holds ~0.0044 SOL of rent from the game key until it is closed: cap it to what that key can carry.
+  maxOpenRooms: Number(process.env.MAX_OPEN_ROOMS) > 0 ? Number(process.env.MAX_OPEN_ROOMS) : 20,
   roomsPerWalletPerHour: 3,
   allowedOrigins: [
     // Local pages are accepted only off mainnet: a sign in text for "localhost" must never be valid for real funds.
@@ -70,5 +79,26 @@ export function loadAuthority(): Keypair {
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(file, "utf8"))));
 }
 
+/** A storage name for this network: the test network keeps the original names, every other network gets its own. Test and real
+ *  data are never mixed (counters, referrals, visitors, maintenance window). */
+/** An optional extra suffix (NET_SUFFIX=lab) keeps a second devnet server's counters, archive and history apart from the first one's. */
+const NET_SUFFIX = process.env.NET_SUFFIX ? `-${process.env.NET_SUFFIX.replace(/[^a-z0-9]/gi, "").toLowerCase()}` : "";
+export const netName = (name: string): string => (config.cluster === "devnet" ? `${name}${NET_SUFFIX}` : `${name}-${config.cluster}${NET_SUFFIX}`);
+
 export const log = (event: string, data: Record<string, unknown> = {}) =>
   console.log(JSON.stringify({ at: new Date().toISOString(), event, ...data }));
+
+/** Whether this server runs the room with this id (see regionSlot). */
+export const ownsRoom = (roomId: string | bigint): boolean => {
+  if (config.regionCount <= 1) return true;
+  try { return BigInt(roomId) % BigInt(config.regionCount) === BigInt(config.regionSlot); } catch { return false; }
+};
+/** A fresh room id that this server owns: the time in ms, then three digits chosen at random among those of this server. */
+export const newOwnedRoomId = (): bigint => {
+  const base = BigInt(Date.now()) * 1000n;
+  const n = BigInt(config.regionCount), slot = BigInt(config.regionSlot);
+  let r = BigInt(Math.floor(Math.random() * 1000));
+  r -= ((base + r) % n + n - slot) % n;
+  if (r < 0n) r += n;
+  return base + r;
+};

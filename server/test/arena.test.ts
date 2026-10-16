@@ -63,8 +63,8 @@ test("head against head: the lighter dies, equal masses both die", () => {
   assert.equal(a.player("W1")!.alive, false);
 });
 
-test("death drops 100% of the mass as orbs on the exact path of the body", () => {
-  const a = new Arena(2, ents(2));
+test("death drops 100% of the mass as orbs on the exact path of the body (rules 1)", () => {
+  const a = new Arena(2, ents(2), { rules: 1 });
   const victim = place(a, "W0", 2995, 1500, 0); // runs into the east edge
   victim.m = 87.5;
   lay(victim, Array.from({ length: 90 }, (_, i) => [2995 - 4 * (i + 1), 1500] as [number, number]));
@@ -229,4 +229,58 @@ test("camping in the middle is punished: a player that never moves from the cent
   }
   assert.equal(camper.alive, false, "the center is not safe at the end");
   assert.equal(camper.killer, "zone");
+});
+
+test("survival: a body three times heavier eats a bite of a small body instead of dying on it", () => {
+  const a = new Arena(3, ents(2), { matchMs: 3600_000, shrinkStartMs: 3600_000, survival: true });
+  const small = place(a, "W1", 1500, 1500, 0);
+  small.m = 25;
+  lay(small, Array.from({ length: 40 }, (_, i) => [1500 - 4 * (i + 1), 1500] as [number, number]));
+  const big = place(a, "W0", 1450, 1506, 0);
+  big.m = 90;
+  big.protectUntil = 0; small.protectUntil = 0;
+  a.orbs.length = 0; // no orb to eat in the same step: only the bite changes the masses
+  a.step(0.05);
+  assert.equal(big.alive, true, "the heavy body is not killed by the small one's body");
+  assert.ok(big.m > 90, "it gained mass");
+  assert.ok(small.m < 25, "the small one lost some");
+});
+
+test("rules 1: the same touch kills the one that touched (a heavy body is not spared)", () => {
+  const a = new Arena(3, ents(2), { rules: 1 });
+  const small = place(a, "W1", 1500, 1500, 0);
+  small.m = 25;
+  lay(small, Array.from({ length: 40 }, (_, i) => [1500 - 4 * (i + 1), 1500] as [number, number]));
+  const big = place(a, "W0", 1450, 1506, 0);
+  big.m = 90;
+  big.protectUntil = 0; small.protectUntil = 0;
+  a.step(0.05);
+  assert.equal(big.alive, false);
+});
+
+test("rules 2: a death leaves richer orbs the heavier the body was, and rules 1 stays exact", () => {
+  const drop = (rules: 1 | 2, m: number) => {
+    const a = new Arena(2, ents(2), { rules });
+    const v = place(a, "W0", 2995, 1500, 0);
+    v.m = m;
+    lay(v, Array.from({ length: 200 }, (_, i) => [2995 - 4 * (i + 1), 1500] as [number, number]));
+    let all: { v: number }[] = [];
+    for (let i = 0; i < 30 && v.alive; i++) all = all.concat(a.step(0.05).newOrbs.filter((o) => o.y === 1500 && o.x > 1000));
+    return all.reduce((s, o) => s + o.v, 0);
+  };
+  assert.ok(Math.abs(drop(1, 600) / 600 - 1) < 0.03, "rules 1 returns the mass (less what the edge took first)");
+  const light = drop(2, 60), heavy = drop(2, 3000);
+  assert.ok(light / 60 > 0.98 && light / 60 < 1.1, `a light body: ${light / 60}`);
+  assert.ok(heavy / 3000 > 1.3 && heavy / 3000 <= 1.5 + 1e-6, `a very heavy body: ${heavy / 3000}`);
+});
+
+test("rules 2: a heavy body is not much slower and every body looks as big as it is", () => {
+  const a1 = new Arena(1, ents(2), { rules: 1 });
+  const s1 = [speedOf(20), speedOf(1000)], r1 = [bodyRadius(20), bodyRadius(1000)];
+  const a2 = new Arena(1, ents(2), { rules: 2 });
+  assert.equal(a2.rules, 2);
+  const s2 = [speedOf(20), speedOf(1000)], r2 = [bodyRadius(20), bodyRadius(1000)];
+  assert.ok(s2[1] / s2[0] > s1[1] / s1[0] + 0.3, "the giant keeps much more of its speed");
+  assert.ok(r2[1] > r1[1] * 1.3, "a body of 1000 mass is drawn clearly bigger");
+  void a1;
 });

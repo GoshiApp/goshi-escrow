@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import { WebSocketServer } from "ws";
-import { authorityPubkey } from "./chain.js";
+import { authorityPubkey, syncHouseWallets } from "./chain.js";
 import { config, log } from "./config.js";
 import { Hub } from "./rooms.js";
 import { startCounters, flush } from "./counters.js";
@@ -10,6 +10,8 @@ import { statsOf } from "./referrals.js";
 import { maintenancePublic, setMaintenance, startMaintenance } from "./maintenance.js";
 import { matchById, matchByTx, matchesByHash, matchesOfWallet, recentMatches, storedReplay } from "./archive.js";
 import { assertKeysSeparated } from "./keys.js";
+import { handleRpc } from "./rpcProxy.js";
+import { botWallets } from "./devbots.js";
 
 // A rate limited RPC answer must never take the server down: log it and keep serving (rooms in memory would be lost).
 process.on("uncaughtException", (e) => log("uncaught_exception", { error: String((e as Error)?.message ?? e).slice(0, 200) }));
@@ -31,7 +33,7 @@ async function cachedJson(key: string, ttlMs: number, compute: () => Promise<unk
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*" });
-    res.end(JSON.stringify({ ok: true, cluster: config.cluster, programId: config.programId, devBots: config.devBots, rooms: hub.rooms.size, clients: hub.clients.size, matchesRunning: hub.matchesRunning(), maintenance: maintenancePublic(), revision: process.env.K_REVISION ?? null }));
+    res.end(JSON.stringify({ ok: true, region: process.env.REGION_NAME ?? null, chainRooms: config.rooms, cluster: config.cluster, programId: config.programId, devBots: config.devBots, rooms: hub.rooms.size, clients: hub.clients.size, matchesRunning: hub.matchesRunning(), maintenance: maintenancePublic(), revision: process.env.K_REVISION ?? null }));
     return;
   }
   const m = /^\/replay\/([0-9A-Za-z_-]{1,40})\/([0-9A-Za-z_]{1,64})$/.exec(req.url ?? "");
@@ -72,7 +74,7 @@ const server = http.createServer((req, res) => {
   }
   if ((req.url ?? "").split("?")[0] === "/live") {
     res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*", "cache-control": "no-store" });
-    res.end(JSON.stringify({ duels: hub.liveDuels() }));
+    res.end(JSON.stringify({ duels: hub.liveDuels(), bots: [...botWallets(), ...(hub.live ? hub.live.botAddresses() : [])], ...(hub.live ? { arena: hub.live.stats() } : {}) }));
     return;
   }
   if ((req.url ?? "").split("?")[0] === "/duels") {
@@ -138,6 +140,7 @@ const server = http.createServer((req, res) => {
     })();
     return;
   }
+  if (handleRpc(req, res)) return;
   if (handleIdeas(req, res, config.allowedOrigins)) return;
   res.writeHead(404).end();
 });
@@ -171,10 +174,13 @@ wss.on("connection", (ws, req) => {
 });
 
 await assertKeysSeparated();
+await syncHouseWallets();
+setInterval(() => void syncHouseWallets(), 5 * 60_000);
 await startCounters();
 await startIdeas();
 startMaintenance();
 hub.start();
+if (process.env.LIVE_ARENA === "1" && config.cluster === "devnet") hub.enableLive();
 process.on("SIGTERM", () => void Promise.all([flush(), flushIdeas()]).finally(() => process.exit(0)));
 
 // Only the newest revision may run matches. Cloud Run keeps an old instance alive while it holds sockets (up to an hour),
@@ -184,6 +190,8 @@ const SELF = process.env.SELF_URL;
 const ME = process.env.K_REVISION;
 if (SELF && ME) {
   setInterval(async () => {
+    // With nobody connected there is nothing to protect, and asking would keep an on-demand server awake forever.
+    if (hub.clients.size === 0 && hub.matchesRunning() === 0) return;
     try {
       const r = await fetch(`${SELF}/health`, { signal: AbortSignal.timeout(4000) });
       const j: any = await r.json();

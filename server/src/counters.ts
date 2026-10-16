@@ -1,10 +1,11 @@
 // Totals that survive restarts and deploys: visits, matches and volume. Stored as three numbers in one Firestore document
 // through its REST API with the credentials of the Cloud Run service account (no library, no extra secrets).
 // Nothing about a person is stored: no address, no cookie, no identifier, only the counts.
-import { log } from "./config.js";
+import { config, log, netName } from "./config.js";
 
 const META = "http://metadata.google.internal/computeMetadata/v1";
-const DOC = "counters/site";
+// One document per network: the test network and the real one never add up (the test one keeps the original name).
+const DOC = `counters/${netName("site")}`;
 const FLUSH_MS = 30_000;
 
 export interface Totals { visits: number; matches: number; volume: bigint; wallets: number }

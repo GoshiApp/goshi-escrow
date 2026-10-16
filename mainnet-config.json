@@ -1,0 +1,17 @@
+{
+  "version": 5,
+  "native": true,
+  "requiredSaboteurs": 0,
+  "cluster": "mainnet-beta",
+  "programId": "BWHy8T5SCpqzLMtjepi6kEdRp9gk8iAVEBaefE3kx4iL",
+  "authority": "FRLftXQZzoKz9tgBs2BPMzoKBnMy1JWwctZxW48q6KV2",
+  "guardian": "3MfeLomwmL3GwhgWKKgosuE4H3kn1rybx5gXMBnvtc3u",
+  "goshiMint": "AUCKjx3Tw78upSvC2EMp8oTScgMnQL5os3i6uVN5pump",
+  "config": "CiNjQ35TAbGY4bEdpj59EeRpjZfXQ4M8XxXk6L3CtCBA",
+  "vault": "EDHcFnGtkbtuHYRvVc86PHV9VYs8CVmTxmSM8bRk1J39",
+  "infraWallet": "GKYPdKzV5hyeiJ8mEtBTTuGFETevZAwEtoPSSJPWMVxL",
+  "liquidityWallet": "C2ecRAApptHG7acachGecj1g6vGL9Dk6s6gckPzVkfT3",
+  "minHolder": "100000000",
+  "initializeTx": "2qTThTrA7TXhKPnZmg14KscXTd2nZTHzF7uQB8Z8fpM9SGXSTKPg7z4VF9t873vfRiqNCmq2NCJcQ3eQZ9iALCi4",
+  "upgradeAuthority": "3MfeLomwmL3GwhgWKKgosuE4H3kn1rybx5gXMBnvtc3u"
+}

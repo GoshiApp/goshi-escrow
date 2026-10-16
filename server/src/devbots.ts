@@ -31,6 +31,8 @@ if (config.devBots) {
 }
 
 export const isBot = (wallet: string) => bots.has(wallet);
+/** The addresses of the test bots (devnet only; empty elsewhere), so the page can say how many seats of a room are bots. */
+export const botWallets = (): string[] => (config.devBots ? [...bots.keys()] : []);
 
 function nextBot(exclude: Set<string>): Keypair {
   for (const [w, kp] of bots) if (!exclude.has(w)) return kp;

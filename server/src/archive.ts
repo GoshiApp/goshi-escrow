@@ -2,7 +2,7 @@
 // transaction, the proof and every hash) and one document per replay file. Anybody can look their matches up by wallet,
 // by room, by transaction or by hash. Everything in it is already public (it is on chain or derived from it).
 // Firestore through its REST API with the service account of the server, like the counters. Without it, nothing is stored.
-import { log } from "./config.js";
+import { config, log } from "./config.js";
 import { firestoreBase, firestoreReady, firestoreToken } from "./counters.js";
 
 export interface MatchRecord {
@@ -93,7 +93,8 @@ async function query(field: string, value: string, limit = 100): Promise<MatchRe
   });
   if (!r.ok) throw new Error(`query ${r.status}`);
   const rows = (await r.json()) as any[];
-  return rows.map((x) => (x.document ? toRecord(x.document) : null)).filter((x): x is MatchRecord => x !== null).sort((a, b) => b.at - a.at);
+  // The archive holds the matches of every network; a server shows only its own.
+  return rows.map((x) => (x.document ? toRecord(x.document) : null)).filter((x): x is MatchRecord => x !== null && x.cluster === config.cluster).sort((a, b) => b.at - a.at);
 }
 
 /**
@@ -104,7 +105,7 @@ export async function recentMatches(limit: number, before?: number, mode?: strin
   if (!firestoreReady()) return { items: [], next: null };
   const want = Math.max(1, Math.min(30, Math.floor(limit)));
   // With a mode filter ask for more rows, then cut: a room of another mode is thrown away after the fact.
-  const ask = mode ? Math.min(150, want * 5) : want + 1;
+  const ask = Math.min(150, want * 5);
   const structuredQuery: Record<string, unknown> = {
     from: [{ collectionId: "matches" }],
     orderBy: [{ field: { fieldPath: "at" }, direction: "DESCENDING" }],
@@ -116,7 +117,9 @@ export async function recentMatches(limit: number, before?: number, mode?: strin
   const r = await call(":runQuery", { method: "POST", body: JSON.stringify({ structuredQuery }) });
   if (!r.ok) throw new Error(`recent ${r.status}`);
   const rows = (await r.json()) as any[];
-  const all = rows.map((x) => (x.document ? toRecord(x.document) : null)).filter((x): x is MatchRecord => x !== null);
+  const scanned = rows.map((x) => (x.document ? toRecord(x.document) : null)).filter((x): x is MatchRecord => x !== null);
+  // Only this network's matches (a mainnet page never shows a devnet match and the other way round), then the mode.
+  const all = scanned.filter((m) => m.cluster === config.cluster);
   let items = mode ? all.filter((m) => m.mode === mode) : all;
   let next: number | null = null;
   if (items.length > want) {
@@ -124,7 +127,7 @@ export async function recentMatches(limit: number, before?: number, mode?: strin
     next = items[want - 1].at;
   } else if (rows.length >= ask) {
     // The page was full of rows (most of them of another mode): there may be older ones, continue after the last one scanned.
-    next = all[all.length - 1]?.at ?? null;
+    next = scanned[scanned.length - 1]?.at ?? null;
   }
   return { items, next };
 }
@@ -135,7 +138,8 @@ export const matchesByHash = (h: string) => query("hashes", h, 20);
 export async function matchById(id: string): Promise<MatchRecord | null> {
   if (!firestoreReady()) return null;
   const r = await call(`/matches/${encodeURIComponent(id)}`);
-  return r.ok ? toRecord(await r.json()) : null;
+  const rec = r.ok ? toRecord(await r.json()) : null;
+  return rec && rec.cluster === config.cluster ? rec : null;
 }
 export async function storedReplay(roomId: string, wallet: string): Promise<Uint8Array | null> {
   if (!firestoreReady()) return null;

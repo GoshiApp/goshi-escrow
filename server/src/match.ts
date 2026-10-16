@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { arenaReplayHash, encodeArenaReplay } from "./game/arena-replay.js";
-import { ARENA, Arena, ZONE_RADII, arenaBrain, bodyPoints, bodyRadius, type Orb, type Role } from "./game/arena.js";
+import { ARENA, Arena, ZONE_RADII, arenaBrain, bodyPoints, bodyRadius, setRules, type Orb, type Role } from "./game/arena.js";
 import {
-  FRENZY, Recorder, angleByte, buildMap, carriedMass, encodeReplay, frenzyBrain, newPlayer, replayHash, stepPlayer,
+  FRENZY, Recorder, angleByte, buildMap, carriedMass, encodeReplay, frenzyBrain, frenzyBrainLevel, FRENZY_LEVELS, type FrenzyLevel, newPlayer, replayHash, stepPlayer,
   type FrenzyMap, type FrenzyPlayer, type PriceSnapshot,
 } from "./game/frenzy.js";
 
@@ -45,6 +45,8 @@ export class Match {
   private ftick = 0;
   private facc = 0;
   private flast = 0;
+  /** Practice: how well the bots play the minute of frenzy (the same level as in the arena). Unset: the standard bot. */
+  private frenzyLevel?: FrenzyLevel;
   private replays = new Map<string, { bytes: Uint8Array; hash: string }>();
   private timer?: ReturnType<typeof setInterval>;
   private acc = 0;
@@ -67,9 +69,11 @@ export class Match {
     private onEnd: (res: MatchResult) => void,
     private shrinkStartMs: number = ARENA.shrinkStartMs,
     readonly frenzyOpts?: FrenzyOptions,
+    survival = false,
+    respawnBatch = 0,
   ) {
     this.matchMs = matchMs;
-    this.arena = new Arena(seed, players, { matchMs, shrinkStartMs });
+    this.arena = new Arena(seed, players, { matchMs, shrinkStartMs, survival, respawnBatch });
     this.seed = seed;
     if (frenzyOpts) {
       this.fmap = buildMap(seed, frenzyOpts.snapshot);
@@ -133,6 +137,26 @@ export class Match {
     };
   }
 
+  /** A seated player's connection dropped in the arena: the bot plays their body, protected (the frenzy minute hurts nobody). */
+  away(wallet: string): boolean {
+    if (this.ended || this.stage !== "arena") return false;
+    return this.arena.away(wallet);
+  }
+
+  setFrenzyLevel(level: FrenzyLevel): void { this.frenzyLevel = level; }
+
+  /** The person plays or hands the body to the elite bot (arena phase only). */
+  setAfk(wallet: string, on: boolean): boolean {
+    if (this.ended || this.stage !== "arena") return false;
+    return this.arena.setAfk(wallet, on);
+  }
+
+  /** The person is back: they steer again, with a few seconds of protection. */
+  back(wallet: string): boolean {
+    if (this.ended || this.stage !== "arena") return false;
+    return this.arena.back(wallet);
+  }
+
   setInput(wallet: string, dx: number, dy: number, boost: boolean) {
     if (this.ended) return;
     if (this.stage === "arena") {
@@ -178,6 +202,7 @@ export class Match {
   begin() {
     const wait = Math.max(0, this.startsAt - Date.now());
     setTimeout(() => {
+      if (this.ended) return;
       this.last = Date.now();
       this.flast = this.last;
       this.timer = setInterval(() => this.loop(), 25);
@@ -191,11 +216,20 @@ export class Match {
     const taken: Record<string, { taken: number[]; back: number[]; hit: boolean }> = {};
     for (const [w, f] of this.fplayers) {
       if (f.bot) {
-        if (this.ftick % 4 === 1) {
-          const a = frenzyBrain(map, f.st, f.jitter);
-          f.st.angle = a.angle;
+        if (this.frenzyLevel) {
+          const seed = (f.jitter + 64) * 13 + w.charCodeAt(w.length - 1);
+          if ((this.ftick + seed) % FRENZY_LEVELS[this.frenzyLevel].every === 0 || this.ftick === 1) {
+            const a = frenzyBrainLevel(map, f.st, this.frenzyLevel, seed);
+            f.st.angle = a.angle;
+            f.st.nitro = a.nitro;
+          }
+        } else {
+          if (this.ftick % 4 === 1) {
+            const a = frenzyBrain(map, f.st, f.jitter);
+            f.st.angle = a.angle;
+          }
+          f.st.nitro = false;
         }
-        f.st.nitro = false;
       } else {
         f.st.angle = angleByte(f.dx, f.dy);
         f.st.nitro = f.nitro;
@@ -314,6 +348,7 @@ export class Match {
 
   private snap() {
     const a = this.arena;
+    setRules(a.rules);
     this.onSnap({
       t: "snap",
       roomId: this.roomId,
@@ -332,11 +367,15 @@ export class Match {
         m: Math.round(p.m * 10) / 10,
         r: Math.round(bodyRadius(p.m) * 10) / 10,
         head: [Math.round(p.x * 10) / 10, Math.round(p.y * 10) / 10],
-        body: p.alive ? bodyPoints(p).slice(1).map((q) => [Math.round(q[0]), Math.round(q[1])]) : [],
+        // A long arena with many bodies sends every other point of a body: half the bytes, the same line on screen.
+        body: p.alive ? bodyPoints(p).slice(1).filter((_, k) => !a.survival || k % 2 === 0).map((q) => [Math.round(q[0]), Math.round(q[1])]) : [],
       })),
       eatenOrbs: this.pendingEaten,
       newOrbs: this.pendingNew.map((o) => ({ id: o.id, x: o.x, y: o.y, v: o.v })),
       events: this.pendingEvents,
+      // Survival: seconds to the next airdrop, and where one just landed (so the page can announce it).
+      ...(a.survival ? { dropIn: Math.round(a.nextDropIn()) } : {}),
+      ...(a.survival && a.dropAt && a.time - a.dropAt.t < 0.06 ? { drop: { x: a.dropAt.x, y: a.dropAt.y } } : {}),
     });
     this.pendingEaten = [];
     this.pendingNew = [];
@@ -356,6 +395,7 @@ export class Match {
       this.seed, this.matchMs, this.shrinkStartMs,
       this.players.map((p) => ({ w: p.w, n: p.n, role: p.role, bot: p.bot, m: start.get(p.w) ?? ARENA.startMass })),
       this.arena.inputLog,
+      this.arena.rules,
     );
     this.replays.set("arena", { bytes, hash: arenaReplayHash(bytes) });
   }

@@ -1,3 +1,4 @@
+import { netName } from "./config.js";
 // Who is counted as a visitor, without tracking anybody.
 //  * Visitors: one per browser per UTC day. The page sends a random id kept in the browser; the server keeps only a salted hash of it
 //    for the day, in memory, and adds one to a total the first time it sees it. Nothing is stored about the person. Browsers that
@@ -28,7 +29,7 @@ export async function noteWallet(wallet: string, isBot: boolean): Promise<void> 
   if (isBot || isFounder(wallet) || known.has(wallet) || !firestoreReady()) return;
   known.add(wallet);
   try {
-    const r = await fetch(`${firestoreBase()}/visitorWallets/${encodeURIComponent(wallet)}?currentDocument.exists=false`, {
+    const r = await fetch(`${firestoreBase()}/${netName("visitorWallets")}/${encodeURIComponent(wallet)}?currentDocument.exists=false`, {
       method: "PATCH",
       headers: { authorization: `Bearer ${await firestoreToken()}`, "content-type": "application/json" },
       body: JSON.stringify({ fields: { at: { integerValue: String(Date.now()) } } }),

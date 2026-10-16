@@ -2,12 +2,14 @@ import crypto from "node:crypto";
 import bs58 from "bs58";
 import { Connection, Keypair, PublicKey, Transaction, sendAndConfirmTransaction, type TransactionInstruction } from "@solana/web3.js";
 import {
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
   getAssociatedTokenAddressSync,
   getAccount,
   getOrCreateAssociatedTokenAccount,
   mintTo,
 } from "@solana/spl-token";
-import { config, loadAuthority, log } from "./config.js";
+import { config, loadAuthority, log, newOwnedRoomId } from "./config.js";
 import { dropSecret, persistSecret } from "./secrets.js";
 import { GoshiEscrow, ROOM_LEN, decodeConfig, decodeRoom, decodeVault, type Proof, type RoomAccount } from "./escrow-client.js";
 
@@ -35,6 +37,19 @@ export const connection = new Connection(config.rpcUrl, "confirmed");
 export const escrow = new GoshiEscrow(new PublicKey(config.programId));
 export const mint = new PublicKey(config.mint);
 export { authority };
+
+/**
+ * The token program that owns the $GOSHI mint: the classic one or Token-2022 (pump.fun creates its tokens with the second).
+ * Read once from the chain; every token account (associated address, balances, test mints) is looked up under it.
+ */
+let tokenProgramCache: PublicKey | null = null;
+export async function tokenProgram(): Promise<PublicKey> {
+  if (tokenProgramCache) return tokenProgramCache;
+  const a = await connection.getAccountInfo(mint);
+  if (!a) return TOKEN_PROGRAM_ID;
+  tokenProgramCache = a.owner.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
+  return tokenProgramCache;
+}
 
 export const configPda = escrow.pda.config;
 export const vaultPda = escrow.pda.vault;
@@ -97,7 +112,7 @@ export const forgetSecret = (roomId: string) => { secrets.delete(roomId); void d
  * wallet signs it and sends it, which pays the first seat and writes the invited wallets into the room. Nobody else can take a seat.
  */
 export async function buildDuelTx(host: string, entryFee: bigint, guests: string[]): Promise<{ roomId: string; tx: string; commit: string }> {
-  const roomId = (BigInt(Date.now()) * 1000n + BigInt(Math.floor(Math.random() * 1000))).toString();
+  const roomId = newOwnedRoomId().toString();
   const secret = crypto.randomBytes(32);
   const commit = crypto.createHash("sha256").update(secret).digest();
   secrets.set(roomId, secret);
@@ -111,7 +126,7 @@ export async function buildDuelTx(host: string, entryFee: bigint, guests: string
 }
 
 export async function createRoom(entryFee: bigint): Promise<{ roomId: string; tx: string; commit: string }> {
-  const roomId = (BigInt(Date.now()) * 1000n + BigInt(Math.floor(Math.random() * 1000))).toString();
+  const roomId = newOwnedRoomId().toString();
   // Commit now (before anybody joins), reveal when the match closes: seed = sha256(secret, blockhash, room id).
   const secret = crypto.randomBytes(32);
   const commit = crypto.createHash("sha256").update(secret).digest();
@@ -130,9 +145,10 @@ export async function currentBlockhash(): Promise<Uint8Array> {
 
 /** A $GOSHI token account of this owner: the associated one if it exists, otherwise the biggest. */
 export async function findTokenAccount(owner: PublicKey): Promise<PublicKey> {
-  const ata = getAssociatedTokenAddressSync(mint, owner);
+  const program = await tokenProgram();
+  const ata = getAssociatedTokenAddressSync(mint, owner, false, program);
   try {
-    await getAccount(connection, ata);
+    await getAccount(connection, ata, undefined, program);
     return ata;
   } catch {
     const res = await connection.getParsedTokenAccountsByOwner(owner, { mint });
@@ -143,16 +159,17 @@ export async function findTokenAccount(owner: PublicKey): Promise<PublicKey> {
 }
 
 export async function ensureTokenAccount(owner: PublicKey): Promise<PublicKey> {
-  return (await getOrCreateAssociatedTokenAccount(connection, authority, mint, owner)).address;
+  const program = await tokenProgram();
+  return (await getOrCreateAssociatedTokenAccount(connection, authority, mint, owner, false, undefined, undefined, program)).address;
 }
 
 export async function mintTestTokens(to: PublicKey, amount: bigint): Promise<string> {
   const ata = await ensureTokenAccount(to);
-  return mintTo(connection, authority, mint, ata, authority, amount);
+  return mintTo(connection, authority, mint, ata, authority, amount, [], undefined, await tokenProgram());
 }
 
 export async function tokenBalance(account: PublicKey): Promise<bigint> {
-  return (await getAccount(connection, account)).amount;
+  return (await getAccount(connection, account, undefined, await tokenProgram())).amount;
 }
 
 export async function goshiBalanceOf(owner: PublicKey): Promise<bigint> {
@@ -290,4 +307,25 @@ export async function onChainRoles(): Promise<{ authority: PublicKey; guardian: 
   const a = await connection.getAccountInfo(configPda);
   const c = a ? decodeConfig(a.data) : null;
   return c ? { authority: c.authority, guardian: c.guardian } : null;
+}
+
+/**
+ * The house wallets the program expects are the ones in its config account: the guardian can change them at any time, and a
+ * closing transaction with other wallets is refused (the match would end in a refund). So the server reads them from the chain
+ * at start and every few minutes, instead of trusting the file it was deployed with.
+ */
+export async function syncHouseWallets(): Promise<void> {
+  try {
+    const a = await connection.getAccountInfo(escrow.pda.config, "confirmed");
+    const c = a ? decodeConfig(a.data) : null;
+    if (!c) return;
+    const infra = c.infraWallet.toBase58(), liq = c.liquidityWallet.toBase58();
+    if (infra !== config.infraWallet || liq !== config.liquidityWallet) {
+      log("house_wallets_from_chain", { infra, liquidity: liq, file: { infra: config.infraWallet, liquidity: config.liquidityWallet } });
+      config.infraWallet = infra;
+      config.liquidityWallet = liq;
+    }
+  } catch (e: any) {
+    log("house_wallets_read_failed", { error: String(e?.message ?? e).slice(0, 160) });
+  }
 }

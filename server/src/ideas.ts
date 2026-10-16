@@ -271,7 +271,7 @@ export function handleIdeas(req: http.IncomingMessage, res: http.ServerResponse,
   if (url.pathname !== "/ideas" && !url.pathname.startsWith("/ideas/")) return false;
   const origin = String(req.headers.origin ?? "");
   const cors: Record<string, string> = allowedOrigins.includes(origin)
-    ? { "access-control-allow-origin": origin, vary: "Origin", "access-control-allow-methods": "GET,POST,DELETE,OPTIONS", "access-control-allow-headers": "content-type,x-admin-token", "access-control-max-age": "600" }
+    ? { "access-control-allow-origin": origin, vary: "Origin", "access-control-allow-methods": "GET,POST,DELETE,OPTIONS", "access-control-allow-headers": "content-type,x-admin-token,x-goshi-session", "access-control-max-age": "600" }
     : {};
   const send = (code: number, body: unknown, extra: Record<string, string> = {}) => {
     res.writeHead(code, { "content-type": "application/json", "cache-control": "no-store", ...cors, ...extra });
@@ -313,7 +313,8 @@ export function handleIdeas(req: http.IncomingMessage, res: http.ServerResponse,
         if (limited(ip, "read", 120, 60_000)) return send(429, { error: "slow_down" });
         let me = voterKey(url.searchParams.get("v"));
         if (GATE) {
-          const w = verifySession(url.searchParams.get("s"), SESSION_SECRET);
+          // The session comes in a header: a token in the address would be written to the request logs.
+          const w = verifySession(String(req.headers["x-goshi-session"] ?? ""), SESSION_SECRET);
           me = w ? crypto.createHash("sha256").update("goshi-idea-wallet:" + w).digest("hex").slice(0, 20) : null;
         }
         const items = listIdeas({ sort: url.searchParams.get("sort") ?? "top", status: url.searchParams.get("status") ?? "", limit: Number(url.searchParams.get("limit") ?? 50), me });

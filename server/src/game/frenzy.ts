@@ -374,3 +374,74 @@ export function frenzyBrain(map: FrenzyMap, p: FrenzyPlayer, jitter: number): { 
   const a = angleByte(best.x - p.x, best.y - p.y);
   return { angle: (a + jitter) & 255, nitro: false };
 }
+
+
+// ───────────── bots by level (practice) ─────────────
+
+export type FrenzyLevel = "easy" | "medium" | "hard" | "insane";
+/** How often a bot looks again (ticks), how far its aim may be off (angle bytes), and whether it dodges lasers and uses nitro. */
+export const FRENZY_LEVELS: Readonly<Record<FrenzyLevel, { every: number; jitter: number; walls: boolean; dodge: boolean; nitro: boolean; value: number }>> = {
+  easy: { every: 6, jitter: 28, walls: false, dodge: false, nitro: false, value: 0 },
+  medium: { every: 4, jitter: 14, walls: true, dodge: true, nitro: false, value: 0.4 },
+  hard: { every: 2, jitter: 4, walls: true, dodge: true, nitro: false, value: 1 },
+  insane: { every: 1, jitter: 0, walls: true, dodge: true, nitro: true, value: 1.4 },
+};
+
+/** Does the straight line from a to b cross the rectangle (grown by r)? */
+function segmentHitsRect(ax: number, ay: number, bx: number, by: number, q: Rect, r: number): boolean {
+  const minX = q.x - r, maxX = q.x + q.w + r, minY = q.y - r, maxY = q.y + q.h + r;
+  let t0 = 0, t1 = 1;
+  const dx = bx - ax, dy = by - ay;
+  for (const [p, qd] of [[-dx, ax - minX], [dx, maxX - ax], [-dy, ay - minY], [dy, maxY - ay]] as [number, number][]) {
+    if (p === 0) { if (qd < 0) return false; continue; }
+    const t = qd / p;
+    if (p < 0) { if (t > t1) return false; if (t > t0) t0 = t; }
+    else { if (t < t0) return false; if (t < t1) t1 = t; }
+  }
+  return true;
+}
+
+/**
+ * A bot that plays the minute properly: it picks the gem with the best mass for the trip, skips gems behind a wall or across a
+ * laser that will be burning when it gets there, and (at the top level) uses nitro on long clear runs.
+ */
+export function frenzyBrainLevel(map: FrenzyMap, p: FrenzyPlayer, level: FrenzyLevel, seed = 0): { angle: number; nitro: boolean } {
+  const L = FRENZY_LEVELS[level];
+  // Every bot has its own taste: how much it likes each gem (a fixed spread per bot and gem) and how steady its aim is. Without
+  // it every bot of a level, starting from the same spot on the same map, would play the very same minute.
+  const taste = (id: number) => 1 + (((Math.imul(id + 1, 2654435761) ^ Math.imul(seed + 7, 40503)) >>> 0) % 1000 / 1000 - 0.5) * (level === "insane" ? 0.5 : 0.9);
+  const wobble = L.jitter + (seed % 5) * (level === "insane" ? 1 : 3);
+  let best: Gem | null = null;
+  let bestScore = -Infinity;
+  let bestDist = 0;
+  const perTick = FRENZY.speed / FRENZY.tickRate;
+  for (const g of map.gems) {
+    const back = p.taken.get(g.id);
+    if (back !== undefined && p.tick < back) continue;
+    const dist = Math.hypot(g.x - p.x, g.y - p.y);
+    let blocked = false;
+    for (const q of map.walls) if (segmentHitsRect(p.x, p.y, g.x, g.y, q, FRENZY.bodyR)) { blocked = true; break; }
+    if (blocked && L.walls) continue;
+    // With nitro on a long run the trip is faster: the prediction of the lasers uses the real speed.
+    const fast = L.nitro && p.m > 45 && p.stun === 0 && dist > 260;
+    if (L.dodge) {
+      const arrive = p.tick + Math.round(dist / (perTick * (fast ? FRENZY.nitroSpeed : 1)));
+      for (const l of map.lasers) {
+        if (!segmentHitsRect(p.x, p.y, g.x, g.y, l, FRENZY.bodyR + 4)) continue;
+        // Burning when it would be crossed, or about to be: not worth the penalty and the stun.
+        if (laserActive(l, p.tick) || [-8, -4, 0, 4, 8, 12].some((d) => laserActive(l, arrive + d))) { blocked = true; break; }
+      }
+      if (blocked) continue;
+    }
+    // Mass per distance: with value > 0 a big gem is worth a longer trip.
+    const score = ((1 + L.value * g.m) / (dist + 40)) * taste(g.id);
+    if (score > bestScore) { bestScore = score; best = g; bestDist = dist; }
+  }
+  if (!best) {
+    // Nothing safe in sight: go to the middle of the map and wait for a laser to go off.
+    return { angle: angleByte(map.w / 2 - p.x, map.h / 2 - p.y), nitro: false };
+  }
+  const a = angleByte(best.x - p.x, best.y - p.y);
+  const nitro = L.nitro && p.m > 45 && bestDist > 260 && p.stun === 0;
+  return { angle: (a + (wobble ? (((p.tick + seed) * 7) % (wobble * 2 + 1)) - wobble : 0)) & 255, nitro };
+}

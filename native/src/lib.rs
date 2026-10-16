@@ -92,6 +92,12 @@ pub const SPL_TOKEN_ID: Pubkey = [
     140, 245, 133, 126, 255, 0, 169,
 ];
 
+/// The Token-2022 program (TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb). pump.fun creates its tokens with it now.
+pub const TOKEN_2022_ID: Pubkey = [
+    6, 221, 246, 225, 238, 117, 143, 222, 24, 66, 93, 188, 228, 108, 205, 218,
+    182, 26, 252, 77, 131, 185, 13, 39, 254, 189, 249, 40, 216, 161, 139, 252
+];
+
 // ───────────── errors ─────────────
 #[repr(u32)]
 #[derive(Clone, Copy)]
@@ -502,7 +508,8 @@ fn initialize(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
     if required as usize > MAX_FREE {
         return Err(E::BadPlayerCount.into());
     }
-    if !mint.is_owned_by(&SPL_TOKEN_ID) {
+    // The classic token program or Token-2022 (the balance layout of a token account is the same in both).
+    if !mint.is_owned_by(&SPL_TOKEN_ID) && !mint.is_owned_by(&TOKEN_2022_ID) {
         return Err(E::WrongAccount.into());
     }
     let (cfg_key, cfg_bump) = config_pda(program);
@@ -641,13 +648,16 @@ fn join_free(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
     if room.try_borrow_data()?[R_MODE] != 0 {
         return Err(E::RoomNotWaiting.into());
     }
-    // The token account must be a classic SPL token account of the mint, owned by the player, with enough balance.
-    if !token.is_owned_by(&SPL_TOKEN_ID) || token.data_len() != 165 {
+    // The token account must be an initialized token account of the mint (of the classic program, or of Token-2022 where
+    // extensions make it longer than 165 bytes), owned by the player, with enough balance.
+    let classic = token.is_owned_by(&SPL_TOKEN_ID) && token.data_len() == 165;
+    let extended = token.is_owned_by(&TOKEN_2022_ID) && token.data_len() >= 165;
+    if !classic && !extended {
         return Err(E::NotEnoughGoshi.into());
     }
     {
         let t = token.try_borrow_data()?;
-        if rd_key(&t, 0) != cfg.mint || rd_key(&t, 32) != *player.key() || rd_u64(&t, 64) < cfg.min_hold {
+        if rd_key(&t, 0) != cfg.mint || rd_key(&t, 32) != *player.key() || rd_u64(&t, 64) < cfg.min_hold || t[108] != 1 {
             return Err(E::NotEnoughGoshi.into());
         }
     }
@@ -1200,6 +1210,14 @@ mod tests {
         assert_eq!((s.winner, s.rake), (1_940_000_000, 60_000_000));
         assert!(settle_duel(SOL, 1).is_none());
         assert!(settle_duel(SOL, 6).is_none());
+    }
+
+    #[test]
+    fn token_2022_id_bytes_are_right() {
+        // TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb, base58 decoded (checked against @solana/spl-token in the tests of the client).
+        assert_eq!(TOKEN_2022_ID.len(), 32);
+        assert_eq!(TOKEN_2022_ID[0], 6);
+        assert_ne!(TOKEN_2022_ID, SPL_TOKEN_ID);
     }
 
     #[test]

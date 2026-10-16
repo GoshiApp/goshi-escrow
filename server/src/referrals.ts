@@ -3,7 +3,7 @@
 // the infrastructure share of the rake, so it is paid by construction out of money the project already keeps, and a
 // self-referral loses money (10% rake paid, 0.25% back). Credits are a public ledger; payouts are made by the team from the
 // infrastructure wallet, not by the game server.
-import { log } from "./config.js";
+import { log, netName } from "./config.js";
 import { firestoreBase, firestoreReady, firestoreToken } from "./counters.js";
 
 export const REFERRAL_BPS = 25n; // 0.25% of the entry fee paid, in basis points of 10_000
@@ -23,7 +23,7 @@ export async function referrerOf(referee: string): Promise<string | null> {
   if (known.has(referee)) return known.get(referee) ?? null;
   if (!firestoreReady()) return null;
   try {
-    const r = await call(`/referrals/${encodeURIComponent(referee)}`);
+    const r = await call(`/${netName("referrals")}/${encodeURIComponent(referee)}`);
     if (r.status === 404) { known.set(referee, null); return null; }
     if (!r.ok) return null;
     const v = String((await r.json()).fields?.referrer?.stringValue ?? "") || null;
@@ -38,7 +38,7 @@ export async function referrerOf(referee: string): Promise<string | null> {
 export async function setReferrer(referee: string, referrer: string): Promise<void> {
   if (!firestoreReady() || referee === referrer || (await referrerOf(referee)) !== null) return;
   try {
-    const r = await call(`/referrals/${encodeURIComponent(referee)}?currentDocument.exists=false`, {
+    const r = await call(`/${netName("referrals")}/${encodeURIComponent(referee)}?currentDocument.exists=false`, {
       method: "PATCH",
       body: JSON.stringify({ fields: { referee: sv(referee), referrer: sv(referrer), at: { integerValue: String(Date.now()) } } }),
     });
@@ -55,7 +55,7 @@ export async function accrueRoom(roomId: string, paidWallets: string[], cashLamp
     const ref = await referrerOf(w);
     if (!ref) continue;
     try {
-      await call(`/refCredits/${encodeURIComponent(`${roomId}__${w}`)}?currentDocument.exists=false`, {
+      await call(`/${netName("refCredits")}/${encodeURIComponent(`${roomId}__${w}`)}?currentDocument.exists=false`, {
         method: "PATCH",
         body: JSON.stringify({ fields: { referrer: sv(ref), referee: sv(w), roomId: sv(roomId), lamports: { integerValue: each.toString() }, at: { integerValue: String(Date.now()) } } }),
       });
@@ -75,7 +75,7 @@ async function runQuery(collection: string, field: string, value: string, limit 
 /** Public numbers of a referrer: how many wallets it brought and how much it has accrued. */
 export async function statsOf(referrer: string): Promise<{ referred: number; rooms: number; lamports: string }> {
   if (!firestoreReady()) return { referred: 0, rooms: 0, lamports: "0" };
-  const [refs, credits] = await Promise.all([runQuery("referrals", "referrer", referrer), runQuery("refCredits", "referrer", referrer)]);
+  const [refs, credits] = await Promise.all([runQuery(netName("referrals"), "referrer", referrer), runQuery(netName("refCredits"), "referrer", referrer)]);
   let sum = 0n;
   for (const d of credits) sum += BigInt(d.fields?.lamports?.integerValue ?? 0);
   return { referred: refs.length, rooms: credits.length, lamports: sum.toString() };
