@@ -11,7 +11,7 @@ import {
 } from "@solana/spl-token";
 import { config, loadAuthority, log, newOwnedRoomId } from "./config.js";
 import { dropSecret, persistSecret } from "./secrets.js";
-import { GoshiEscrow, ROOM_LEN, decodeConfig, decodeRoom, decodeVault, type Proof, type RoomAccount } from "./escrow-client.js";
+import { GoshiEscrow, LEGACY_ROOM_LEN, ROOM_LEN, TRAP_FLUSH_MIN, decodeConfig, decodeRoom, decodeTraps, decodeVault, type Proof, type RoomAccount } from "./escrow-client.js";
 
 export interface ChainRoom {
   id: string;
@@ -29,6 +29,8 @@ export interface ChainRoom {
   createdAt: number;
   /** The slot in which the room became active; "0" while it waits. The seed uses the blockhash of that block. */
   activeSlot: string;
+  /** v6: the backpack of each paid seat (lamports for traps), in seat order; all 0n in older rooms. */
+  backpacks: bigint[];
 }
 
 const authority = loadAuthority();
@@ -73,11 +75,14 @@ function toRoom(pubkey: PublicKey, a: RoomAccount): ChainRoom {
     guests: a.guests.map((g) => g.toBase58()),
     createdAt: Number(a.createdAt),
     activeSlot: a.activeSlot.toString(),
+    backpacks: a.backpacks,
   };
 }
 
 export async function listRooms(): Promise<ChainRoom[]> {
-  const all = await connection.getProgramAccounts(escrow.programId, { filters: [{ dataSize: ROOM_LEN }] });
+  // v6 rooms and the rooms made before it (no backpacks) have different sizes: both are read.
+  const [now, old] = await Promise.all([ROOM_LEN, LEGACY_ROOM_LEN].map((dataSize) => connection.getProgramAccounts(escrow.programId, { filters: [{ dataSize }] })));
+  const all = [...now, ...old];
   const out: ChainRoom[] = [];
   for (const { pubkey, account } of all) {
     const r = decodeRoom(account.data);
@@ -201,20 +206,39 @@ export async function startDuel(roomId: string): Promise<string> {
   return tx;
 }
 
-export async function finalizeDuel(roomId: string, winner: string, proof?: Proof): Promise<string> {
+export async function finalizeDuel(roomId: string, winner: string, proof?: Proof, backpacks?: Backpacks): Promise<string> {
   const tx = await send(
-    [escrow.finalizeDuel(authority.publicKey, BigInt(roomId), new PublicKey(config.infraWallet), new PublicKey(config.liquidityWallet), new PublicKey(winner), proof)],
+    [...backpackIx(roomId, backpacks), escrow.finalizeDuel(authority.publicKey, BigInt(roomId), new PublicKey(config.infraWallet), new PublicKey(config.liquidityWallet), new PublicKey(winner), proof)],
     authority
   );
   log("duel_finalized", { roomId, winner, tx });
   return tx;
 }
 
+/** What each paid seat spent on traps, in seat order, when the room has backpacks: settled in the same transaction. */
+export interface Backpacks { paid: string[]; spent: bigint[] }
+const backpackIx = (roomId: string, b?: Backpacks) =>
+  b && b.paid.length ? [escrow.settleBackpacks(authority.publicKey, BigInt(roomId), b.paid.map((w) => new PublicKey(w)), b.spent)] : [];
+
+/** Pays the trap pots to the house wallets once they hold the minimum. Best effort: it is retried after the next match. */
+export async function flushTrapsIfDue(): Promise<void> {
+  try {
+    const a = await connection.getAccountInfo(escrow.pda.traps);
+    const t = a ? decodeTraps(a.data) : null;
+    if (!t || (t.maintenance < TRAP_FLUSH_MIN && t.project < TRAP_FLUSH_MIN)) return;
+    const tx = await send([escrow.flushTraps(authority.publicKey, new PublicKey(config.infraWallet), new PublicKey(config.liquidityWallet))], authority);
+    log("traps_flushed", { maintenance: t.maintenance.toString(), project: t.project.toString(), tx });
+  } catch (e: any) {
+    log("traps_flush_failed", { error: String(e?.message ?? e).slice(0, 160) });
+  }
+}
+
 /** Podium: paid players only, in rank order. Saboteurs are paid their share from the same instruction. */
-export async function finalizeRoyale(roomId: string, podium: string[], saboteurs: string[], proof?: Proof): Promise<string> {
+export async function finalizeRoyale(roomId: string, podium: string[], saboteurs: string[], proof?: Proof, backpacks?: Backpacks): Promise<string> {
   if (podium.length !== 3) throw new Error("the podium needs 3 players");
   const tx = await send(
     [
+      ...backpackIx(roomId, backpacks),
       escrow.finalizeRoyale(
         authority.publicKey,
         BigInt(roomId),
@@ -231,6 +255,27 @@ export async function finalizeRoyale(roomId: string, podium: string[], saboteurs
   return tx;
 }
 
+/** Contract v7: every paid seat (seat order) receives its bag; the program refuses a sum above 97 percent of the cash. */
+export async function finalizeBags(roomId: string, paid: string[], bags: bigint[], proof?: Proof, backpacks?: Backpacks): Promise<string> {
+  const tx = await send(
+    [
+      ...backpackIx(roomId, backpacks),
+      escrow.finalizeBags(
+        authority.publicKey,
+        BigInt(roomId),
+        new PublicKey(config.infraWallet),
+        new PublicKey(config.liquidityWallet),
+        paid.map((w) => new PublicKey(w)),
+        bags,
+        proof
+      ),
+    ],
+    authority
+  );
+  log("bags_finalized", { roomId, bags: bags.map(String), tx });
+  return tx;
+}
+
 /** Seats a pass winner as the 10th paid player of a room that already has 9. Nothing is charged. */
 export async function joinWithPass(roomId: string, holder: string): Promise<string> {
   const tx = await send([escrow.joinWithPass(authority.publicKey, new PublicKey(holder), BigInt(roomId))], authority);
@@ -238,9 +283,10 @@ export async function joinWithPass(roomId: string, holder: string): Promise<stri
   return tx;
 }
 
-export async function finalizeVs(roomId: string, ranking: string[], proof?: Proof): Promise<string> {
+export async function finalizeVs(roomId: string, ranking: string[], proof?: Proof, backpacks?: Backpacks): Promise<string> {
   const tx = await send(
     [
+      ...backpackIx(roomId, backpacks),
       escrow.finalizeVs(
         authority.publicKey,
         BigInt(roomId),

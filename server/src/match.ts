@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
 import { arenaReplayHash, encodeArenaReplay } from "./game/arena-replay.js";
-import { ARENA, Arena, ZONE_RADII, arenaBrain, bodyPoints, bodyRadius, setRules, type Orb, type Role } from "./game/arena.js";
+import { BOT_SKINS } from "./game/skins.js";
+import { ARENA, Arena, POWER_CASHOUT, POWER_KAMIKAZE, POWER_SHIELD, TRAP_PRICE_PCT, ZONE_RADII, arenaBrain, bodyPoints, bodyRadius, setRules, type Orb, type Role, type RulesVersion, type TrapKind } from "./game/arena.js";
+/** Two traps from the same player are at least this far apart. */
+const TRAP_COOLDOWN_MS = 4000;
+/** Bought length in survival: each purchase adds this much, up to the maximum. */
+export const LENGTH_STEP = 0.05;
+export const LENGTH_MAX = 0.2;
+/** Price of one step of length, in lamports: half to maintenance (infra wallet), half to the project (liquidity wallet). */
+export const LENGTH_PRICE = 10_000_000n;
 import {
   FRENZY, Recorder, angleByte, buildMap, carriedMass, encodeReplay, frenzyBrain, frenzyBrainLevel, FRENZY_LEVELS, type FrenzyLevel, newPlayer, replayHash, stepPlayer,
   type FrenzyMap, type FrenzyPlayer, type PriceSnapshot,
@@ -35,11 +43,17 @@ export const FRENZY_GAP_MS = 3000;
 const STEP = 1 / ARENA.tickRate;
 
 /** One running match. Pure game plus a timer: it never touches the network or the chain. */
+/** An orb as it travels: a coin of the market in survival (c, q), a plain orb elsewhere. */
+/** `t` (a big orb that needs mass) is only told where that rule applies: the cash arena has no such orbs. */
+const orbMsg = (o: Orb, cash = false) => ({ id: o.id, x: o.x, y: o.y, v: o.v, ...(o.c ? { c: o.c, q: o.q } : {}), ...(o.tier && !cash ? { t: o.tier } : {}) });
+
 export class Match {
   readonly arena: Arena;
   /** Start of the arena phase (a minute plus a short gap after `startsAt` when there is a frenzy). */
   readonly arenaStartsAt: number;
   private stage: "frenzy" | "gap" | "arena";
+  /** The arena phase is on (the minute of frenzy is over): bodies can be handed to late joiners. */
+  get inArena(): boolean { return !this.ended && this.stage === "arena"; }
   private fmap?: FrenzyMap;
   private fplayers = new Map<string, { st: FrenzyPlayer; rec: Recorder; dx: number; dy: number; nitro: boolean; bot: boolean; jitter: number; moved: boolean }>();
   private ftick = 0;
@@ -53,6 +67,7 @@ export class Match {
   private last = 0;
   private pendingEaten: number[] = [];
   private pendingNew: Orb[] = [];
+  private pendingFuses: [number, number, number, number][] = [];
   private pendingEvents: { k: "death"; w: string; by: string; rank: number }[] = [];
   private tick = 0;
   private matchMs: number;
@@ -71,9 +86,13 @@ export class Match {
     readonly frenzyOpts?: FrenzyOptions,
     survival = false,
     respawnBatch = 0,
+    /** The rules of this arena; unset, the server's default (a free practice may run newer rules than the paid rooms). */
+    rules?: RulesVersion,
   ) {
     this.matchMs = matchMs;
-    this.arena = new Arena(seed, players, { matchMs, shrinkStartMs, survival, respawnBatch });
+    // Bots wear the meme and coin skins in turn (cosmetic: never changes a rule).
+    players.forEach((p, i) => { if (p.bot && !p.skin) p.skin = BOT_SKINS[i % BOT_SKINS.length]; });
+    this.arena = new Arena(seed, players, { matchMs, shrinkStartMs, survival, respawnBatch, ...(rules ? { rules } : {}) });
     this.seed = seed;
     if (frenzyOpts) {
       this.fmap = buildMap(seed, frenzyOpts.snapshot);
@@ -106,10 +125,10 @@ export class Match {
       shrinkStartMs: this.shrinkStartMs,
       world: { w: ARENA.w, h: ARENA.h },
       zone: { cx: ARENA.w / 2, cy: ARENA.h / 2, r0: ARENA.zoneR0, rMin: ARENA.zoneRMin, radii: ZONE_RADII },
-      orbs: this.arena.orbs.map((o) => ({ id: o.id, x: o.x, y: o.y, v: o.v })),
+      orbs: this.arena.orbs.map((o) => orbMsg(o, this.arena.cash)),
       you,
       roles: this.roles(),
-      skins: Object.fromEntries(this.players.filter((p) => p.skin).map((p) => [p.w, p.skin])),
+      skins: this.skinsMap(),
       ...(this.fmap && this.frenzyOpts
         ? {
             frenzy: {
@@ -144,6 +163,98 @@ export class Match {
   }
 
   setFrenzyLevel(level: FrenzyLevel): void { this.frenzyLevel = level; }
+
+  /** Rules 5, a room paid by bag: the lamports minted into coins (0 when the room pays by place). */
+  bagPool = 0;
+  /** Cash arena: a person enters with `entry` lamports; its coins fall on the map with the next picture. */
+  cashEnter(wallet: string, entry: number): void {
+    const p = this.arena.player(wallet);
+    if (!p || !this.arena.cash) return;
+    const ev = this.arena.cashEnter(p, entry);
+    this.pendingNew.push(...ev.newOrbs);
+  }
+
+  /** Mints the pot into coins before the start messages go out (the first wave lies on the map from the beginning). */
+  setBags(pool: bigint): void {
+    if (this.bagPool || pool <= 0n || this.arena.rules < 5) return;
+    this.bagPool = Number(pool);
+    this.arena.bagFee = Number(this.fee);
+    this.arena.mintBags(this.bagPool);
+  }
+  /**
+   * What every paid seat is paid at the end, in seat order. A body alive keeps its bag. What nobody holds (coins left on the map,
+   * coins not yet fallen and the bags of the saboteurs) is split in equal parts among the best three paid players; the remainder
+   * of that split goes to the first. The sum is always the whole pot.
+   */
+  bagsFor(paid: string[]): bigint[] {
+    const a = this.arena;
+    const own = new Map<string, number>();
+    let held = 0;
+    // A body alive, or one that cashed out, keeps its bag. What was spent on traps and powers went to the house.
+    for (const p of a.players) if ((p.alive || p.banked !== undefined) && p.role === "paid" && p.bag) { own.set(p.w, p.bag); held += p.bag; }
+    const rest = this.bagPool - held - a.bagSpent;
+    const top = a.ranking().filter((r) => r.role === "paid").slice(0, 3).map((r) => r.w);
+    if (top.length && rest > 0) {
+      const each = Math.floor(rest / top.length);
+      top.forEach((w, i) => own.set(w, (own.get(w) ?? 0) + each + (i === 0 ? rest - each * top.length : 0)));
+    }
+    return paid.map((w) => BigInt(own.get(w) ?? 0));
+  }
+
+  /** v6 backpacks: what each paid seat can still spend on traps (lamports) and the entry fee that sets the prices. */
+  private backpack = new Map<string, { left: bigint; spent: bigint }>();
+  private fee = 0n;
+  private trapAt = new Map<string, number>();
+  setBackpacks(paid: string[], backpacks: bigint[], fee: bigint): void {
+    this.fee = fee;
+    paid.forEach((w, i) => { if ((backpacks[i] ?? 0n) > 0n) this.backpack.set(w, { left: backpacks[i], spent: 0n }); });
+  }
+  /** Survival: one more step of bought length for this body (+5 percent, at most +20). Returns the new bonus, or null. */
+  growLength(wallet: string): number | "max" | null {
+    const p = this.arena.players.find((q) => q.w === wallet);
+    if (!this.arena.survival || !p || !p.alive) return null;
+    const now = p.lengthBonus ?? 0;
+    if (now >= LENGTH_MAX - 1e-9) return "max";
+    p.lengthBonus = Math.min(LENGTH_MAX, now + LENGTH_STEP);
+    return p.lengthBonus;
+  }
+
+  /** What each paid seat spent on traps, in seat order (for settle_backpacks). */
+  spentFor(paid: string[]): bigint[] {
+    return paid.map((w) => this.backpack.get(w)?.spent ?? 0n);
+  }
+  /** Price of a trap in this room (lamports): a share of the entry fee. */
+  trapPrice(kind: TrapKind): bigint {
+    return (this.fee * BigInt(TRAP_PRICE_PCT[kind])) / 100n;
+  }
+  /**
+   * A player sets a trap. In a room with money it is paid from the backpack (never more than it holds); in a free match it
+   * costs nothing but waits a few seconds between two traps. Returns what is left in the backpack, or why it was refused.
+   */
+  trap(wallet: string, kind: TrapKind, free: boolean): { ok: true; left: string } | { ok: false; reason: "not_now" | "no_backpack" | "too_soon" } {
+    if (this.ended || this.stage !== "arena") return { ok: false, reason: "not_now" };
+    // Cash arena: no lasers, puddles, kamikaze or shields (they confused more than they helped); only cashing out.
+    if (this.arena.cash && kind !== POWER_CASHOUT) return { ok: false, reason: "not_now" };
+    const pi = this.arena.players.findIndex((p) => p.w === wallet);
+    if (pi < 0 || !this.arena.players[pi].alive) return { ok: false, reason: "not_now" };
+    const now = Date.now();
+    if (now - (this.trapAt.get(wallet) ?? 0) < TRAP_COOLDOWN_MS) return { ok: false, reason: "too_soon" };
+    // A room paid by bag: the arena charges the bag itself (and the record replays it), no backpack.
+    if (!free && this.bagPool) free = true;
+    if (!free) {
+      const b = this.backpack.get(wallet);
+      const price = this.trapPrice(kind);
+      if (!b || price <= 0n || b.left < price) return { ok: false, reason: "no_backpack" };
+      if (!this.arena.queueTrap(pi, kind)) return { ok: false, reason: "not_now" };
+      b.left -= price;
+      b.spent += price;
+      this.trapAt.set(wallet, now);
+      return { ok: true, left: b.left.toString() };
+    }
+    if (!this.arena.queueTrap(pi, kind)) return { ok: false, reason: "not_now" };
+    this.trapAt.set(wallet, now);
+    return { ok: true, left: "0" };
+  }
 
   /** The person plays or hands the body to the elite bot (arena phase only). */
   setAfk(wallet: string, on: boolean): boolean {
@@ -199,10 +310,15 @@ export class Match {
     return [...this.replays].map(([w, r]) => ({ w, hash: r.hash, bytes: r.bytes.length }));
   }
 
+  /** The skin each player wears in this match (wallet -> skin id), for the screens and for the archived replay. */
+  skinsMap(): Record<string, string> {
+    return Object.fromEntries(this.players.filter((p) => p.skin).map((p) => [p.w, p.skin as string]));
+  }
+
   begin() {
     const wait = Math.max(0, this.startsAt - Date.now());
     setTimeout(() => {
-      if (this.ended) return;
+      if (this.ended || this.timer) return;
       this.last = Date.now();
       this.flast = this.last;
       this.timer = setInterval(() => this.loop(), 25);
@@ -319,9 +435,11 @@ export class Match {
     this.last = now;
     let steps = 0;
     while (this.acc >= STEP && steps < 5 && !this.ended) {
+      this.botPowers();
       const ev = this.arena.step(STEP, arenaBrain);
       this.pendingEaten.push(...ev.eatenOrbs);
       this.pendingNew.push(...ev.newOrbs);
+      if (ev.fuses) this.pendingFuses.push(...ev.fuses);
       for (const d of ev.deaths) {
         const rank = this.arena.ranking().find((r) => r.w === d.w)?.rank ?? 0;
         this.pendingEvents.push({ k: "death", w: d.w, by: d.by, rank });
@@ -365,14 +483,32 @@ export class Match {
         prot: p.alive && p.protectUntil > a.time,
         h: Math.round(p.heading * 100) / 100,
         m: Math.round(p.m * 10) / 10,
+        ...(this.bagPool || a.cash ? { bag: p.bag ?? 0 } : {}),
+        ...(a.cash ? { en: a.entryOf(p), qk: p.qk ?? 0, ...(p.boostSpill ? { bs: p.boostSpill } : {}) } : {}),
+        ...(p.cashoutAt !== undefined ? { co: Math.round((a.time - p.cashoutAt) * 10) / 10 } : {}),
+        ...(p.cashoutAt !== undefined && p.cashedBag !== undefined ? { cb: p.cashedBag } : {}),
+        ...(p.alive && (p.shieldUntil ?? 0) > a.time ? { sh: 1 } : {}),
         r: Math.round(bodyRadius(p.m) * 10) / 10,
         head: [Math.round(p.x * 10) / 10, Math.round(p.y * 10) / 10],
         // A long arena with many bodies sends every other point of a body: half the bytes, the same line on screen.
         body: p.alive ? bodyPoints(p).slice(1).filter((_, k) => !a.survival || k % 2 === 0).map((q) => [Math.round(q[0]), Math.round(q[1])]) : [],
       })),
+      // Traps on the map: kind, owner, the beam ends or the puddle center and radius, and seconds left.
+      ...(a.traps.length ? { traps: a.traps.map((t) => ({ k: t.kind, o: t.owner, x: Math.round(t.x), y: Math.round(t.y), x2: Math.round(t.x2), y2: Math.round(t.y2), r: t.r, s: Math.round((t.until - a.time) * 10) / 10 })) } : {}),
+      // Survival: the map follows the leader, so its square travels with every snapshot.
+      ...(a.survival ? { world: { x0: Math.round(ARENA.w / 2 - a.mapR), y0: Math.round(ARENA.h / 2 - a.mapR), w: Math.round(a.mapR * 2), h: Math.round(a.mapR * 2) } } : {}),
+      // Rules 6: the boss, where its cycle is (calm, warn, open) and the seconds to the next change.
+      ...(a.rules >= 6 ? { boss: this.bossMsg() } : {}),
+      ...(a.pops.length ? { pops: a.pops.splice(0) } : {}),
+      // Rooms with money: the SOL lying free on the map and the SOL in the bags of the players alive, right now (lamports).
+      ...(a.cash || this.bagPool ? { sol: { free: a.orbs.reduce((n, o) => n + (o.l ?? 0), 0), held: a.players.reduce((n, p) => n + (p.alive ? p.bag ?? 0 : 0) + (p.boostSpill ?? 0), 0) } } : {}),
+      ...(a.cash ? { cashInfo: { in: a.cashIn, n: a.cashEntries, house: a.cashHouse, paid: a.cashPaid, outs: a.cashOuts, kills: a.cashKills, cut: a.cashCut, left: a.cashLeft } } : {}),
+      // Rules 7: the zone holds still for the last three, and how long it still does.
+      ...(a.freezeLeft() > 0 ? { freeze: Math.ceil(a.freezeLeft()) } : {}),
       eatenOrbs: this.pendingEaten,
-      newOrbs: this.pendingNew.map((o) => ({ id: o.id, x: o.x, y: o.y, v: o.v })),
+      newOrbs: this.pendingNew.map((o) => orbMsg(o, this.arena.cash)),
       events: this.pendingEvents,
+      ...(this.pendingFuses.length ? { fuses: this.pendingFuses } : {}),
       // Survival: seconds to the next airdrop, and where one just landed (so the page can announce it).
       ...(a.survival ? { dropIn: Math.round(a.nextDropIn()) } : {}),
       ...(a.survival && a.dropAt && a.time - a.dropAt.t < 0.06 ? { drop: { x: a.dropAt.x, y: a.dropAt.y } } : {}),
@@ -380,9 +516,55 @@ export class Match {
     this.pendingEaten = [];
     this.pendingNew = [];
     this.pendingEvents = [];
+    this.pendingFuses = [];
+  }
+
+  private bossMsg() {
+    const b = this.arena.boss();
+    if (!b) return null;
+    const ph = this.arena.bossPhase();
+    return { w: b.w, st: ph.state, in: Math.ceil(ph.inS) };
+  }
+
+  /**
+   * Rules 6: the bots use the powers too, through the same queue as a person (so the record replays them). A small bot near the
+   * boss while it is exposed may blow up on it (one kamikaze every 8 seconds in the whole arena); a bot that is the boss raises
+   * its shield when it is exposed and is being bitten.
+   */
+  private lastKamikaze = -99;
+  private botPowers() {
+    const a = this.arena;
+    if (a.rules < 6 || a.cash) return;
+    const b = a.boss();
+    if (!b) return;
+    const ph = a.bossPhase();
+    if (ph.state !== "open") return;
+    const bi = a.players.indexOf(b);
+    if (b.bot && !b.afk && (b.shieldReady ?? 0) <= a.time && this.tick % 7 === 0) a.queueTrap(bi, POWER_SHIELD);
+    if (a.time - this.lastKamikaze < 8) return;
+    for (let i = 0; i < a.players.length; i++) {
+      const p = a.players[i];
+      if (!p.alive || !p.bot || p === b || p.m * 8 > b.m || (this.tick + i) % 11 !== 0) continue;
+      if (a.queueTrap(i, POWER_KAMIKAZE)) { this.lastKamikaze = a.time; break; }
+    }
   }
 
   /** Stops the loop without reporting a result (the player left). */
+  /** True while the match is paused (a live arena nobody is in): no step runs, everything stays exactly as it was. */
+  get paused(): boolean { return this.timer === undefined && !this.ended; }
+  /** Pauses the match: the clock stops, nothing moves, nothing is spent. */
+  pause() {
+    if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
+  }
+  /** Goes on from where it paused (the time asleep is not played). */
+  resume() {
+    if (this.ended || this.timer) return;
+    this.last = Date.now();
+    this.flast = this.last;
+    this.acc = 0;
+    this.timer = setInterval(() => this.loop(), 25);
+  }
+
   stop() {
     this.ended = true;
     if (this.timer) clearInterval(this.timer);
@@ -396,6 +578,8 @@ export class Match {
       this.players.map((p) => ({ w: p.w, n: p.n, role: p.role, bot: p.bot, m: start.get(p.w) ?? ARENA.startMass })),
       this.arena.inputLog,
       this.arena.rules,
+      this.bagPool,
+      this.arena.bagFee,
     );
     this.replays.set("arena", { bytes, hash: arenaReplayHash(bytes) });
   }

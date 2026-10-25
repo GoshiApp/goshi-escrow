@@ -17,6 +17,8 @@ export interface MatchRecord {
   ranking: unknown;
   payout: unknown;
   proof: unknown;
+  /** The skin (or goshi color) each wallet wore, so a replay shows every body as it was. */
+  skins?: Record<string, string>;
 }
 
 const sv = (s: string) => ({ stringValue: s });
@@ -46,6 +48,7 @@ export async function archiveMatch(rec: MatchRecord, replays: Map<string, Uint8A
       ranking: sv(JSON.stringify(rec.ranking)),
       payout: sv(JSON.stringify(rec.payout)),
       proof: sv(JSON.stringify(rec.proof ?? null)),
+      skins: sv(JSON.stringify(rec.skins ?? {})),
     };
     const r = await call(`/matches/${encodeURIComponent(rec.roomId)}`, { method: "PATCH", body: JSON.stringify({ fields }) });
     if (!r.ok) throw new Error(`match ${r.status} ${(await r.text()).slice(0, 80)}`);
@@ -78,6 +81,7 @@ function toRecord(d: any): MatchRecord | null {
       ranking: JSON.parse(f.ranking?.stringValue ?? "[]"),
       payout: JSON.parse(f.payout?.stringValue ?? "null"),
       proof: JSON.parse(f.proof?.stringValue ?? "null"),
+      skins: JSON.parse(f.skins?.stringValue ?? "{}"),
     };
   } catch {
     return null;

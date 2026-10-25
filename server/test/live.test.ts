@@ -54,7 +54,7 @@ test("when the places are full the next people wait in order and take a place wh
   }
 });
 
-test("viewers get every other picture, and the orbs of a skipped one travel with the next; one address can only open two viewers", () => {
+test("viewers get every other picture, and the orbs of a skipped one travel with the next; one address can only open eight viewers, but a player always gets in", () => {
   const live = new LiveArena(() => {});
   try {
     const mk = (ip: string) => {
@@ -65,7 +65,11 @@ test("viewers get every other picture, and the orbs of a skipped one travel with
     const a = mk("1.1.1.1"), b = mk("1.1.1.1"), extra = mk("1.1.1.1");
     assert.equal(live.watch(a.c), true);
     assert.equal(live.watch(b.c), true);
-    assert.equal(live.watch(extra.c), false, "a third viewer from the same address is refused");
+    for (let i = 0; i < 6; i++) assert.equal(live.watch(mk("1.1.1.1").c), true);
+    assert.equal(live.watch(extra.c), false, "a ninth viewer from the same address is refused");
+    // Taking a place is never refused by the viewer limits (the places are the limit).
+    live.join(extra.c, "late", null);
+    assert.equal(extra.c.live.slot !== null, true, "a person who joins to play gets a place even past the viewer limit");
     const base = { t: "snap", roomId: "live-arena", players: [], events: [] };
     const snaps = (live as any);
     a.got.length = 0;

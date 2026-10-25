@@ -60,8 +60,33 @@ export interface Orb {
   x: number;
   y: number;
   v: number;
+  /** Rules 5, a room paid by bag: the lamports this coin is worth (the pot is minted into coins). */
+  l?: number;
   /** True for the orbs a body leaves when it dies: the bots go for them first. */
   loot?: boolean;
+  /** Survival: 1 or 2 for the big coins that only big bodies can eat (see canEatOrb). */
+  tier?: number;
+  /** Survival: the coin it is (BTC, ETH, DOGE...) and how much of it; its mass is what that amount is worth in dollars. */
+  c?: string;
+  q?: number;
+}
+
+/** Survival coins: one unit of mass is worth this many dollars, at the prices taken when the arena started. */
+export const USD_PER_MASS = 0.01;
+/** Which coins fall, and how often (the meme and small chains more, BTC rarer). */
+const COIN_MIX: readonly [string, number][] = [["DOGE", 30], ["SOL", 22], ["AVAX", 14], ["BNB", 12], ["ETH", 12], ["BTC", 10]];
+
+/** Survival coins by size: the smallest mass that can eat each tier, and the value of a big coin. */
+export const ORB_TIER_MIN = [0, 1500, 10_000] as const;
+export const ORB_TIER_VALUE = [0, 40, 300] as const;
+/** A body this heavy no longer eats the small coins (it is too big for them); loot and big coins are always worth it. */
+export const ORB_SMALL_MAX = 6000;
+export function canEatOrb(m: number, o: Orb): boolean {
+  // A coin that carries SOL is money: anybody may eat it, whatever its size.
+  if (o.loot || o.l) return true;
+  const t = o.tier ?? 0;
+  if (t === 0) return m < ORB_SMALL_MAX;
+  return m >= ORB_TIER_MIN[t];
 }
 export interface Player {
   w: string;
@@ -83,6 +108,8 @@ export interface Player {
   protectUntil: number;
   /** The person asked the computer to play their body (an elite bot) while they are away from the keyboard. */
   afk?: boolean;
+  /** Survival: extra length bought with SOL (0 to 0.2, that is up to 20 percent longer). */
+  lengthBonus?: number;
   /** The team's own verified wallet in the live arena: it eats other bodies instead of dying on them. */
   ceo?: boolean;
   /** True while the bot plays this body because the person's connection dropped. */
@@ -92,6 +119,25 @@ export interface Player {
   /** Seconds into the match when it died; -1 while alive. */
   diedAt: number;
   killer: string;
+  /** Cash arena (test): the lamports this person entered with, and how many players with an entry at least as big it eliminated. */
+  entry?: number;
+  qk?: number;
+  /** Cash arena: the bag it took out when it cashed out (lamports). */
+  cashedBag?: number;
+  /** Cash arena: SOL taken from the bag by the current boost, popped out as a coin when the boost stops (lamports). */
+  boostSpill?: number;
+  /** Rules 6: the shield of the boss lasts until this time, and can be raised again from shieldReady. */
+  shieldUntil?: number;
+  shieldReady?: number;
+  /** Rules 6: when the body started to cash out (it leaves the arena CASHOUT_S later if still alive), and what it took out. */
+  cashoutAt?: number;
+  /** Cash arena: the bag when the cash out began (it flows out evenly from there). */
+  cashBag0?: number;
+  /** Cash arena: the mass when the cash out began (it shrinks from there to nothing). */
+  cashMass0?: number;
+  banked?: number;
+  /** Rules 5, a room paid by bag: the lamports of the coins this body carries. */
+  bag?: number;
 }
 
 export interface Death {
@@ -102,6 +148,10 @@ export interface StepResult {
   eatenOrbs: number[];
   newOrbs: Orb[];
   deaths: Death[];
+  /** Cash arena: the cut of a bag a killer took on the spot. */
+  killCuts?: { w: string; from: string; l: number }[];
+  /** Cash arena: SOL coins that just fused, as [from x, from y, into x, into y] (the page draws the link and the fusion). */
+  fuses?: [number, number, number, number][];
 }
 
 // Sized like the .io snake games: a head is about 15 units wide at the start and moves about 9 radii per second.
@@ -114,13 +164,59 @@ export interface StepResult {
  * `setRules` selects the version the next calls use; an Arena sets its own at every step, so a record is always played with the
  * rules it was recorded with.
  */
-export type RulesVersion = 1 | 2;
-export const RULES_NOW: RulesVersion = 2;
+export type RulesVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
+/**
+ * Rules 8: the pot is not cut in equal coins. Each coin gets a weight from a fixed sequence (many small, some middling, a few
+ * big ones, up to thirteen times the smallest) and its share of the lamports follows the weight; the remainder of the integer
+ * division goes to the heaviest one, so the sum is exact. Returns the shares and the weights.
+ */
+export function unevenSplit(total: number, n: number, salt: number): { parts: number[]; weights: number[] } {
+  const weights: number[] = [];
+  for (let k = 0; k < n; k++) { const f = ((k + salt) * 0.6180339887498949) % 1; weights.push(0.15 + f * 0.6 + f * f * f * 2.5); }
+  const sum = weights.reduce((a, b) => a + b, 0);
+  const parts = weights.map((w) => Math.floor((total * w) / sum));
+  let big = 0;
+  for (let k = 1; k < n; k++) if (weights[k] > weights[big]) big = k;
+  parts[big] += total - parts.reduce((a, b) => a + b, 0);
+  return { parts, weights };
+}
+/** Rules 7: when three bodies are left, the zone holds still this long so they can gather the coins lying around. */
+export const FINAL3_FREEZE_S = 10;
+export const RULES_NOW: RulesVersion = 3;
 let activeRules: RulesVersion = RULES_NOW;
+/**
+ * Rules 4 (the test network first): nothing left to chance but where a dead body's coins land. The zone closes on the center,
+ * the coins and the showers fall on a fixed public pattern (a golden-angle spiral), the starts are an exact ring. A new arena
+ * uses the default set here; a record keeps the version it was played with.
+ */
+let defaultRules: RulesVersion = RULES_NOW;
+export const setDefaultRules = (v: RulesVersion): void => { defaultRules = v; };
+/** The golden angle and the fractional part of n times the golden ratio: an even, fixed spread with no randomness. */
+const goldenFrac = (n: number) => (n * 0.6180339887498949) % 1;
+/**
+ * An even, fixed spread over a disc with no randomness: the R2 sequence (two unrelated irrational steps), so the angle and the
+ * distance of point n never follow each other. (The golden angle with the golden fraction as distance are the same number in
+ * disguise and lay every point on one spiral line.) Returns the angle in radians and the distance as a share of the radius.
+ */
+const R2A = 0.7548776662466927, R2B = 0.5698402909980532;
+const spread = (n: number): [number, number] => [((0.5 + n * R2A) % 1) * Math.PI * 2, Math.sqrt((0.5 + n * R2B) % 1)];
 export const setRules = (v: RulesVersion): void => { activeRules = v; };
 export const rulesActive = (): RulesVersion => activeRules;
-export const bodyRadius = (m: number) => (activeRules === 1 ? 10 + 1.1 * Math.sqrt(m) : 8 + 1.9 * Math.sqrt(m));
-export const speedOf = (m: number) => (activeRules === 1 ? 135 / (1 + m / 600) : 135 / (1 + m / 2500));
+/** Radius of a body. Rules 8: past a mass of 200 it widens more slowly, so a giant (the boss) does not fill the map. */
+export const bodyRadius = (m: number) => (activeRules === 1 ? 10 + 1.1 * Math.sqrt(m) : activeRules >= 8 && m > 200 ? 34.87 + (Math.sqrt(m) - 14.142) : 8 + 1.9 * Math.sqrt(m));
+export const speedOf = (m: number) =>
+  activeRules === 1 ? 135 / (1 + m / 600) : activeRules === 2 ? 135 / (1 + m / 2500) : 135 / (1 + 0.18 * Math.log(1 + Math.max(0, m) / 100));
+/** Distance between two body points. Rules 3: a body heavier than 432 keeps getting longer (a quarter power of its mass). */
+export const segmentSpacingOf = (m: number) =>
+  activeRules >= 3 && m > 432 ? Math.min(lengthCap ? MAX_SPACING : Infinity, ARENA.segmentSpacing * Math.pow(m / 432, 0.25)) : ARENA.segmentSpacing;
+/** Survival has no length limit: its arena sets this off at every step (a timed match keeps the cap, its records rely on it). */
+let lengthCap = true;
+export const setLengthCap = (on: boolean): void => { lengthCap = on; };
+const MAX_SPACING = 40;
+/** Boost cost per second, as a share of the mass. Rules 3: cheaper, so a big body can still catch somebody. */
+export const boostCostOf = () => (activeRules >= 3 ? 0.006 : ARENA.boostCostPerSecond);
+/** Path points kept behind a head: enough for the longest body of the rules in use. */
+export const trailKeep = () => Math.round((ARENA.maxBodySegments * (activeRules >= 3 ? MAX_SPACING : ARENA.segmentSpacing)) / ARENA.trailSpacing) + 6;
 /** Turn rate in radians per second: a heavy body turns wider, but never becomes a slug (a log, not a hyperbola). */
 export const turnRateOf = (m: number) => ARENA.turnRate / (1 + 0.35 * Math.log(1 + Math.max(0, m - ARENA.startMass) / 60));
 export const segmentCount = (m: number) =>
@@ -146,8 +242,10 @@ export interface ZonePlan {
 }
 
 /** Random, nested circles: every next circle lies completely inside the previous one but its center is somewhere else. */
-export function buildZonePlan(rng: Rng, matchMs: number, shrinkStartMs: number): ZonePlan {
+export function buildZonePlan(rng: Rng, matchMs: number, shrinkStartMs: number, fixed = false): ZonePlan {
   const centers = [{ x: ARENA.w / 2, y: ARENA.h / 2 }];
+  // Rules 4: every circle closes on the center, the same in every match.
+  if (fixed) { for (let i = 0; i < ZONE_PHASES; i++) centers.push({ ...centers[0] }); return { centers, matchMs, shrinkStartMs }; }
   for (let i = 0; i < ZONE_PHASES; i++) {
     const room = ZONE_RADII[i] - ZONE_RADII[i + 1];
     const ang = rng.range(0, Math.PI * 2);
@@ -210,18 +308,94 @@ export function zoneDamagePerSecond(mass: number, phase: number): number {
 
 /** Body points of a player, head first, spaced `segmentSpacing` apart along its path. */
 export function bodyPoints(p: Player): [number, number][] {
-  const every = Math.round(ARENA.segmentSpacing / ARENA.trailSpacing);
+  const step = (segmentSpacingOf(p.m) * (1 + (p.lengthBonus ?? 0))) / ARENA.trailSpacing;
   const n = segmentCount(p.m);
   const out: [number, number][] = [[p.x, p.y]];
   for (let k = 1; k <= n; k++) {
-    const idx = k * every - 1;
+    const idx = Math.round(k * step) - 1;
     if (idx >= p.trail.length) break;
     out.push(p.trail[idx]);
   }
   return out;
 }
 
+/** Survival map: it starts at the zone radius and grows with the square root of the leader's mass from this mass on. */
+const MAP_GROW_FROM = 1500;
+const MAP_R_MAX = 30_000;
+const MAP_GROW_PER_S = 160;
+const MAP_SHRINK_PER_S = 45;
+
+export const TRAP_LASER = 1;
+export const TRAP_SLOW = 2;
+export type TrapKind = typeof TRAP_LASER | typeof TRAP_SLOW | typeof POWER_KAMIKAZE | typeof POWER_SHIELD | typeof POWER_CASHOUT;
+/**
+ * Rules 6, the boss: the heaviest body alive, when it weighs at least BOSS_MIN_MASS and twice the next one. Every BOSS_CYCLE_S
+ * seconds it is announced (BOSS_WARN_S ahead) and then exposed for BOSS_OPEN_S: its tail (the last quarter of its body) can be bitten by any
+ * head without dying, each bite takes BOSS_BITE of its mass (half to the biter, half on the floor with the same share of its bag).
+ * Against it: the kamikaze (a body near it blows up and takes up to KAMIKAZE_TAKE of its mass, the kamikaze dies). Its answer:
+ * the shield (no bites and no kamikaze for SHIELD_S, once every SHIELD_CD_S, costs SHIELD_COST of its mass).
+ * Cash out: a body channels CASHOUT_S at half speed; if it is still alive it leaves the arena with what it carries.
+ */
+export const POWER_KAMIKAZE = 3;
+export const POWER_SHIELD = 4;
+export const POWER_CASHOUT = 5;
+export const BOSS_MIN_MASS = 300;
+export const BOSS_LEAD = 2;
+export const BOSS_CYCLE_S = 30;
+export const BOSS_WARN_S = 5;
+export const BOSS_OPEN_S = 4;
+export const BOSS_BITE = 0.01;
+export const KAMIKAZE_R = 320;
+/** Rules 6: only the last quarter of the boss (its tail) is exposed. */
+export const BOSS_TAIL = 0.75;
+export const KAMIKAZE_TAKE = 0.15;
+export const SHIELD_S = 4;
+export const SHIELD_CD_S = 25;
+export const SHIELD_COST = 0.05;
+export const CASHOUT_S = 5;
+/** Cash arena: the most SOL coins the map holds; past it the smallest fuse into their nearest (nothing is lost). */
+export const CASH_COIN_CAP = 140;
+/** Cash arena: the share of a victim's bag that goes straight to whoever eliminated it. */
+export const CASH_KILL_CUT = 0.15;
+/** Cash arena: eliminations needed to cash out, and the entry a bot counts as (lamports). */
+export const CASH_KILLS = 3;
+export const CASH_MIN_ENTRY = 3_000_000;
+/** Cash arena: mass per lamport of a coin (20 000 mass per SOL, so a 0.003 SOL entry is 60 mass on the map). */
+export const CASH_MASS_PER_LAMPORT = 20_000 / 1e9;
+export const TRAP_LASER_S = 3;
+export const TRAP_LASER_HALF = 130;
+/** Share of the mass a laser takes from a head it touches (and gives to its owner). */
+export const TRAP_LASER_TAKE = 0.1;
+export const TRAP_SLOW_S = 6;
+export const TRAP_SLOW_R = 110;
+export const TRAP_SLOW_FACTOR = 0.5;
+/** Price of each trap as a share of the entry fee (percent), paid from the backpack. */
+/** Price of a trap or a power, in percent of the entry fee (paid from the backpack, or from the bag in a room paid by bag). */
+export const TRAP_PRICE_PCT: Readonly<Record<TrapKind, number>> = { 1: 10, 2: 5, 3: 0, 4: 5, 5: 0 };
+export interface Trap { kind: number; owner: string; /** Heads this laser already hit. */ hit: string[]; x: number; y: number; x2: number; y2: number; r: number; until: number }
+
+/** Distance from a point to a segment. */
+function segDist(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
+  const vx = bx - ax, vy = by - ay;
+  const l2 = vx * vx + vy * vy || 1;
+  const t = Math.max(0, Math.min(1, ((px - ax) * vx + (py - ay) * vy) / l2));
+  return Math.hypot(px - (ax + vx * t), py - (ay + vy * t));
+}
+
 export class Arena {
+  /** Set by the server at start: when true, no power but the cash out can be used, in any mode. */
+  static onlyCashout = false;
+  /** How often (in steps) a bot's brain runs; 1 = every step. The live arenas set more to stay light. */
+  brainEvery = 1;
+  private halfCache = new Map<string, [number, number][]>();
+  private halfStep = -1;
+  /** Every other body point of a player, worked out once per step and shared by every bot's brain. */
+  halfPoints(o: Player): [number, number][] {
+    if (this.halfStep !== this.stepN) { this.halfStep = this.stepN; this.halfCache.clear(); }
+    let v = this.halfCache.get(o.w);
+    if (!v) { v = bodyPoints(o).filter((_, k) => k % 2 === 0); this.halfCache.set(o.w, v); }
+    return v;
+  }
   readonly rng: Rng;
   readonly players: Player[] = [];
   orbs: Orb[] = [];
@@ -240,13 +414,164 @@ export class Arena {
   readonly inputLog: [number, number, number, number][] = [];
   private stepN = 0;
   private lastKey: number[] = [];
+  /** Traps on the map (rules 3): a laser behind a tail kills a head that touches it, a puddle slows the heads in it. */
+  traps: Trap[] = [];
+  private pendingTraps: { pi: number; kind: number }[] = [];
+  /** Survival: when each dominant head last paid for knocking a body (by pair), so a rub costs once a second. */
+  private knockAt = new Map<string, number>();
+
+  /** A player sets a trap behind its tail; it is placed at the next step and written in the record (flag 4). */
+  queueTrap(pi: number, kind: TrapKind): boolean {
+    const p = this.players[pi];
+    if (!p || !p.alive || this.rules < 3) return false;
+    // Powers are off in every mode where the server says so (the test network): only the cash out stays.
+    if (Arena.onlyCashout && kind !== POWER_CASHOUT) return false;
+    if (kind !== TRAP_LASER && kind !== TRAP_SLOW && (this.rules < 6 || !this.powerAllowed(p, kind))) return false;
+    if (this.spellCost(kind) > (p.bag ?? 0)) return false;
+    this.pendingTraps.push({ pi, kind });
+    return true;
+  }
+
+  /** Rules 6: whether this body may use this power now (the boss is near for a kamikaze, it is the boss for a shield...). */
+  powerAllowed(p: Player, kind: number): boolean {
+    if (kind === POWER_KAMIKAZE) {
+      const b = this.boss();
+      return !!b && b !== p && (b.shieldUntil ?? 0) <= this.time && this.nearestPoint(b, p.x, p.y) >= 0;
+    }
+    if (kind === POWER_SHIELD) return this.boss() === p && (p.shieldReady ?? 0) <= this.time;
+    // Cash arena: you may only cash out after eliminating CASH_KILLS players who entered with at least as much as you.
+    // In the cash arena only a body that paid an entry can cash out (a guest without a wallet plays for nothing).
+    if (kind === POWER_CASHOUT) return p.cashoutAt === undefined && (!this.cash || (!!p.entry && (p.qk ?? 0) >= CASH_KILLS));
+    return false;
+  }
+  /** Rules 6: the boss, the heaviest body alive when it weighs at least BOSS_MIN_MASS and twice the next one. */
+  boss(): Player | null {
+    if (this.rules < 6) return null;
+    let a: Player | null = null, b: Player | null = null;
+    for (const p of this.players) {
+      if (!p.alive) continue;
+      if (!a || p.m > a.m) { b = a; a = p; } else if (!b || p.m > b.m) b = p;
+    }
+    return a && a.m >= BOSS_MIN_MASS && a.m >= (b ? b.m : 0) * BOSS_LEAD ? a : null;
+  }
+  /** Rules 6: the boss cycle. "calm", "warn" (it will be exposed) or "open" (its back can be bitten), and seconds to the next change. */
+  bossPhase(): { state: "calm" | "warn" | "open"; inS: number } {
+    const t = this.time % BOSS_CYCLE_S, openAt = BOSS_CYCLE_S - BOSS_OPEN_S, warnAt = openAt - BOSS_WARN_S;
+    if (t < warnAt) return { state: "calm", inS: warnAt - t };
+    if (t < openAt) return { state: "warn", inS: openAt - t };
+    return { state: "open", inS: BOSS_CYCLE_S - t };
+  }
+  /** Index of the point of body b nearest to (x, y) within KAMIKAZE_R, or -1. */
+  private nearestPoint(b: Player, x: number, y: number): number {
+    const pts = bodyPoints(b);
+    let best = -1, bd = KAMIKAZE_R * KAMIKAZE_R;
+    for (let i = 0; i < pts.length; i++) {
+      const d = (pts[i][0] - x) ** 2 + (pts[i][1] - y) ** 2;
+      if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+  }
+  /** Rules 5 and 6, a room paid by bag: the entry fee, which prices the traps and powers paid from the bag. */
+  bagFee = 0;
+  /** Lamports spent from bags on traps and powers: they leave the players' pot and go to the house (maintenance). */
+  bagSpent = 0;
+  spellCost(kind: number): number {
+    return this.bagFee > 0 ? Math.floor((this.bagFee * (TRAP_PRICE_PCT[kind as TrapKind] ?? 0)) / 100) : 0;
+  }
+  /** Takes `mass` from body b at point (x, y): `give` of it goes to the taker, the rest falls there as a coin with the same share of b's bag. */
+  private chip(b: Player, mass: number, taker: Player | null, give: number, x: number, y: number, ev: StepResult): void {
+    mass = Math.max(0, Math.min(mass, b.m - ARENA.minMass));
+    if (mass <= 0) return;
+    const share = b.bag ? Math.floor((b.bag * mass) / b.m) : 0;
+    b.m -= mass;
+    if (share) b.bag = (b.bag ?? 0) - share;
+    const toTaker = taker ? mass * give : 0;
+    if (taker) { taker.m += toTaker; if (taker.m > taker.peak) taker.peak = taker.m; }
+    const o: Orb = { id: this.nextOrbId++, x: Math.round(x), y: Math.round(y), v: Math.round((mass - toTaker) * 1000) / 1000, loot: true };
+    if (share) { o.l = share; o.c = "SOL"; o.q = share / 1e9; }
+    this.orbs.push(o);
+    ev.newOrbs.push(o);
+  }
+  /** Rules 6: a head on the exposed tail of the boss bites instead of dying (at most two bites a second per head). */
+  private bossAt = new Map<string, number>();
+  private bossBite(a: Player, b: Player, k: number, n: number, ev: StepResult): boolean {
+    if (this.rules < 6 || b !== this.bossNow || this.bossPhase().state !== "open" || (b.shieldUntil ?? 0) > this.time || k < n * BOSS_TAIL) return false;
+    if ((this.bossAt.get(a.w) ?? -1) > this.time - 0.5) return true;
+    this.bossAt.set(a.w, this.time);
+    const pt = bodyPoints(b)[k] ?? [b.x, b.y];
+    this.chip(b, b.m * BOSS_BITE, a, 0.5, pt[0], pt[1], ev);
+    return true;
+  }
+  private bossNow: Player | null = null;
+
+  private placeTrap(pi: number, kind: number, ev: StepResult): void {
+    const p = this.players[pi];
+    if (!p || !p.alive) return;
+    if (this.rules >= 6 && !this.powerAllowed(p, kind) && kind !== TRAP_LASER && kind !== TRAP_SLOW) return;
+    const cost = this.spellCost(kind);
+    if (cost > (p.bag ?? 0)) return;
+    if (cost) { p.bag = (p.bag ?? 0) - cost; this.bagSpent += cost; }
+    if (kind === POWER_KAMIKAZE) {
+      const b = this.boss()!;
+      const at = bodyPoints(b)[this.nearestPoint(b, p.x, p.y)];
+      this.chip(b, Math.min(b.m * KAMIKAZE_TAKE, p.m * 3 + 50), null, 0, at[0], at[1], ev);
+      this.kill(p, "kamikaze", ev);
+      return;
+    }
+    if (kind === POWER_SHIELD) {
+      p.m = Math.max(ARENA.minMass, p.m * (1 - SHIELD_COST));
+      p.shieldUntil = this.time + SHIELD_S;
+      p.shieldReady = this.time + SHIELD_CD_S;
+      return;
+    }
+    if (kind === POWER_CASHOUT) {
+      p.cashoutAt = this.time;
+      // Cash arena: the bag starts flowing to the wallet at once; what has left is safe, what is still in the bag can be lost.
+      if (this.cash) {
+        if (p.boostSpill) { p.bag = (p.bag ?? 0) + p.boostSpill; p.boostSpill = 0; }
+        // What can leave grows with the fights won: the entry times (1 + eliminations of players with an entry like yours). The
+        // rest of the bag stays in the game: it falls over the map for the others.
+        const cap = this.cashCap(p);
+        if ((p.bag ?? 0) > cap) { this.pendingSpill.push((p.bag ?? 0) - cap); p.bag = cap; }
+        p.cashedBag = 0; p.cashBag0 = p.bag ?? 0; p.cashMass0 = p.m; this.cashOuts++;
+      }
+      return;
+    }
+    const pts = bodyPoints(p);
+    const tail = pts[pts.length - 1];
+    const prev = pts[Math.max(0, pts.length - 2)];
+    let ux = tail[0] - prev[0], uy = tail[1] - prev[1];
+    const len = Math.hypot(ux, uy) || 1;
+    ux /= len; uy /= len;
+    if (kind === TRAP_LASER) {
+      // Rules 4: the laser is shot from the head, straight ahead, so it is aimed; before that it lay across the tail.
+      if (this.rules >= 4) {
+        const hx = Math.cos(p.heading), hy = Math.sin(p.heading), r0 = bodyRadius(p.m) + 18;
+        this.traps.push({ kind, owner: p.w, hit: [], x: p.x + hx * r0, y: p.y + hy * r0, x2: p.x + hx * (r0 + TRAP_LASER_HALF * 2), y2: p.y + hy * (r0 + TRAP_LASER_HALF * 2), r: 0, until: this.time + TRAP_LASER_S });
+      } else {
+        const cx = tail[0] + ux * 24, cy = tail[1] + uy * 24;
+        const h = TRAP_LASER_HALF;
+        this.traps.push({ kind, owner: p.w, hit: [], x: cx - uy * h, y: cy + ux * h, x2: cx + uy * h, y2: cy - ux * h, r: 0, until: this.time + TRAP_LASER_S });
+      }
+    } else {
+      this.traps.push({ kind, owner: p.w, hit: [], x: tail[0] + ux * 40, y: tail[1] + uy * 40, x2: 0, y2: 0, r: TRAP_SLOW_R, until: this.time + TRAP_SLOW_S });
+    }
+  }
+
+  /** Speed factor of a head in a puddle that is not its own. */
+  private slowOf(p: Player): number {
+    for (const t of this.traps) {
+      if (t.kind === TRAP_SLOW && t.owner !== p.w && Math.hypot(p.x - t.x, p.y - t.y) < t.r) return TRAP_SLOW_FACTOR;
+    }
+    return 1;
+  }
 
   constructor(
     seed: number,
     entrants: { w: string; n: string; role: Role; bot: boolean }[],
     opts: { matchMs?: number; shrinkStartMs?: number; survival?: boolean; respawnBatch?: number; rules?: RulesVersion } = {},
   ) {
-    this.rules = opts.rules ?? RULES_NOW;
+    this.rules = opts.rules ?? defaultRules;
     setRules(this.rules);
     this.survival = opts.survival === true;
     this.respawnBatch = opts.respawnBatch ?? 0;
@@ -255,10 +580,10 @@ export class Arena {
     this.rng = new Rng(seed);
     const cx = ARENA.w / 2;
     const cy = ARENA.h / 2;
-    this.zonePlan = buildZonePlan(this.rng, this.matchMs, this.shrinkStartMs);
+    this.zonePlan = buildZonePlan(this.rng, this.matchMs, this.shrinkStartMs, this.rules >= 4);
     entrants.forEach((e, i) => {
       // Spread the starts on a ring inside the zone, facing the center.
-      const ang = (i / entrants.length) * Math.PI * 2 + this.rng.range(-0.1, 0.1);
+      const ang = (i / entrants.length) * Math.PI * 2 + (this.rules >= 4 ? 0 : this.rng.range(-0.1, 0.1));
       const rad = ARENA.zoneR0 * 0.6;
       const x = cx + Math.cos(ang) * rad;
       const y = cy + Math.sin(ang) * rad;
@@ -283,11 +608,25 @@ export class Arena {
 
   /** How many orbs the map holds: survival keeps it richer, because nobody leaves it to rest. */
   private foodTarget(): number {
-    return this.survival ? 900 : ARENA.orbTarget;
+    // Survival: the food follows the area of the map, so a bigger map is not an empty one.
+    if (this.survival) return Math.min(4000, Math.round(900 * (this.mapR / ARENA.zoneR0) ** 2));
+    return this.rules >= 5 ? this.coinCap(this.zone().r) : ARENA.orbTarget;
+  }
+
+  /**
+   * Survival: the map is a circle that follows the leader, like slither.io. It grows as the heaviest body grows and, when that
+   * body dies, shrinks back slowly (the bodies left outside take the zone damage, as in a normal match). Radius in world units.
+   */
+  mapR = ARENA.zoneR0;
+  private mapTarget(): number {
+    let top = 0;
+    for (const p of this.players) if (p.alive && p.m > top) top = p.m;
+    return Math.min(MAP_R_MAX, Math.max(ARENA.zoneR0, ARENA.zoneR0 * Math.sqrt(top / MAP_GROW_FROM)));
   }
 
   zoneNow(): ZoneState {
-    return zoneState(this.time, this.zonePlan);
+    if (this.survival) return { cx: ARENA.w / 2, cy: ARENA.h / 2, r: this.mapR, phase: 1, state: "hold", inSeconds: 0, target: null };
+    return zoneState(this.zoneTime(), this.zonePlan);
   }
 
   zone(): Zone {
@@ -300,14 +639,74 @@ export class Arena {
   /** Seconds to the next airdrop. */
   nextDropIn(): number { return Math.max(0, this.nextDrop - this.time); }
 
+  /** Survival: keeps a stock of tier 1 and tier 2 coins that follows how many bodies are big enough to eat them. */
+  private stockTiers(ev: StepResult): void {
+    const want = [0, 0, 0];
+    for (const p of this.players) if (p.alive) { if (p.m >= ORB_TIER_MIN[1]) want[1] += 45; if (p.m >= ORB_TIER_MIN[2]) want[2] += 30; }
+    const have = [0, 0, 0];
+    for (const o of this.orbs) if (o.tier) have[o.tier]++;
+    for (const tier of [1, 2] as const) {
+      for (let i = have[tier]; i < Math.min(want[tier], 400); i++) {
+        const o = this.newOrb();
+        o.tier = tier;
+        o.v = ORB_TIER_VALUE[tier] * (this.rules >= 4 ? 1 : 0.6 + this.rng.next() * 0.8);
+        o.v = Math.round(o.v * 10) / 10;
+        this.asCoin(o);
+        this.orbs.push(o);
+        ev.newOrbs.push(o);
+      }
+    }
+  }
+
+  /** Survival: the prices of the coins, taken once when the arena starts (dollars per coin). */
+  coinPrices: Record<string, number> | null = null;
+
+  /** Turns an orb into a coin of the market: picks the coin, and the amount of it worth the orb's mass at the start prices. */
+  private asCoin(o: Orb): Orb {
+    const prices = this.coinPrices;
+    if (!prices) return o;
+    let pick = (this.rules >= 4 ? goldenFrac(o.id) : this.rng.next()) * COIN_MIX.reduce((s2, c) => s2 + c[1], 0);
+    let sym = COIN_MIX[0][0];
+    for (const [c, w] of COIN_MIX) { if (pick < w) { sym = c; break; } pick -= w; }
+    // A worthless orb never looks like SOL: only coins that really carry SOL are SOL.
+    if (sym === "SOL") return o;
+    const price = prices[sym];
+    if (!(price > 0)) return o;
+    // The amount, rounded to what a person would write (sats for BTC), and the mass it is really worth.
+    const usd = o.v * USD_PER_MASS;
+    const raw = usd / price;
+    const q = sym === "BTC" ? Math.max(1, Math.round(raw * 1e8)) / 1e8 : Number(raw.toPrecision(2));
+    o.c = sym;
+    o.q = q;
+    o.v = Math.max(0.1, Math.round(((q * price) / USD_PER_MASS) * 100) / 100);
+    return o;
+  }
+
+  /** Rules 4: how many orbs and showers were laid, the position in their fixed patterns. */
+  private orbSeq = 0;
+  private placeSeq = 0;
+  private dropSeq = 0;
+
   private newOrb(): Orb {
     // Uniform over the current safe zone, so loot always lies where people have to go.
     const z = this.zone();
-    const a = this.rng.range(0, Math.PI * 2);
-    const r = Math.sqrt(this.rng.next()) * (z.r - 30);
-    const k = this.rng.next();
-    const v = k < 0.7 ? ARENA.orbValues[0] : k < 0.93 ? ARENA.orbValues[1] : ARENA.orbValues[2];
-    return { id: this.nextOrbId++, x: Math.round(z.cx + Math.cos(a) * r), y: Math.round(z.cy + Math.sin(a) * r), v };
+    let a: number, r: number, v: number;
+    if (this.rules >= 4) {
+      // A fixed spiral over the zone, and a fixed cycle of values: the same map for everybody, every time.
+      const n = this.orbSeq++;
+      const [sa, sr] = spread(n);
+      a = sa;
+      r = sr * (z.r - 30);
+      const c = n % 20;
+      v = c < 14 ? ARENA.orbValues[0] : c < 19 ? ARENA.orbValues[1] : ARENA.orbValues[2];
+    } else {
+      a = this.rng.range(0, Math.PI * 2);
+      r = Math.sqrt(this.rng.next()) * (z.r - 30);
+      const k = this.rng.next();
+      v = k < 0.7 ? ARENA.orbValues[0] : k < 0.93 ? ARENA.orbValues[1] : ARENA.orbValues[2];
+    }
+    const o: Orb = { id: this.nextOrbId++, x: Math.round(z.cx + Math.cos(a) * r), y: Math.round(z.cy + Math.sin(a) * r), v };
+    return this.survival ? this.asCoin(o) : o;
   }
 
   player(w: string) {
@@ -351,21 +750,54 @@ export class Arena {
 
   private kill(p: Player, by: string, ev: StepResult) {
     if (!p.alive) return;
+    // The SOL a boost held goes back with the bag.
+    if (p.boostSpill) { p.bag = (p.bag ?? 0) + p.boostSpill; p.boostSpill = 0; }
+    // Cash arena: a kill counts toward cashing out when the victim entered with at least as much as the killer.
+    if (this.cash) {
+      const k = this.player(by);
+      if (k && k !== p && this.entryOf(p) >= this.entryOf(k)) k.qk = (k.qk ?? 0) + 1;
+      if (k && k !== p) this.cashKills++;
+      // The killer takes CASH_KILL_CUT of the victim's bag straight away; the rest falls over the map.
+      if (k && k !== p && k.alive && p.bag) {
+        const cut = Math.floor(p.bag * CASH_KILL_CUT);
+        if (cut > 0) { this.cashCut += cut; p.bag -= cut; k.bag = (k.bag ?? 0) + cut; k.m += cut * CASH_MASS_PER_LAMPORT; ev.killCuts = ev.killCuts ?? []; ev.killCuts.push({ w: k.w, from: p.w, l: cut }); }
+      }
+    }
     p.alive = false;
     p.diedAt = this.time;
     p.killer = by;
+    // Cash arena: a bot's entry ends with its life (it pays a new one when it comes back).
+    if (this.cash && p.bot) { p.entry = undefined; p.qk = 0; }
     ev.deaths.push({ w: p.w, by });
     // 100% of the mass becomes orbs over the exact path of the body.
     const pts = bodyPoints(p);
-    const count = Math.max(1, Math.min(ARENA.maxDeathOrbs, Math.floor(p.m)));
+    // Rules 8, a room paid by bag: every coin on the map is worth money, so a dead body drops only its bag (none at all when it is
+    // empty), and one of the last three keeps its bag (it reached the final; the coins of its mass still fall, worthless ones do not).
+    const keepBag = this.bagMode && this.freezeAt >= 0;
+    // Never more coins than lamports: every coin carries at least one lamport, the smallest amount of SOL.
+    const count = this.bagMode ? (p.bag && !keepBag ? Math.min(Math.max(24, this.cash ? Math.ceil((2 * p.bag) / this.cashMin) : 0), p.bag, Math.max(this.cash ? Math.ceil((2 * p.bag) / this.cashMin) : 1, Math.floor(p.m))) : 0) : Math.max(1, Math.min(ARENA.maxDeathOrbs, Math.floor(p.m)));
     // Version 2: a big body leaves richer orbs (up to half as much again), so beating a giant is worth the trouble.
     const value = (p.m / count) * (this.rules >= 2 ? 1 + Math.min(0.5, p.m / 6000) : 1);
+    // Rules 4: the coins are scattered over the whole safe zone (the one thing left to the seed), not laid in a line where the
+    // body was, so they do not all go to whoever happened to be next to it.
+    const zl = this.rules >= 4 ? this.zone() : null;
+    // Rules 8: the bag of a dead body falls in coins of different sizes too.
+    const bagCut = this.rules >= 8 && p.bag && count ? unevenSplit(p.bag, count, this.stepN % 97).parts : null;
     for (let i = 0; i < count; i++) {
-      const [x, y] = pts[Math.min(pts.length - 1, Math.floor((i * pts.length) / count))];
+      let [x, y] = pts[Math.min(pts.length - 1, Math.floor((i * pts.length) / count))];
+      if (zl) { const t = this.rng.range(0, Math.PI * 2), d = Math.sqrt(this.rng.next()) * Math.max(0, zl.r - 40); x = zl.cx + Math.cos(t) * d; y = zl.cy + Math.sin(t) * d; }
       const o: Orb = { id: this.nextOrbId++, x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10, v: Math.round(value * 1000) / 1000, loot: true };
+      // Rules 5: the bag falls with the body, spread over its coins (the remainder on the first one).
+      if (p.bag) {
+        const l = bagCut ? bagCut[i] : Math.floor(p.bag / count) + (i === 0 ? p.bag % count : 0);
+        if (l > 0) { o.l = l; o.c = "SOL"; o.q = l / 1e9; }
+        // Cash arena: a coin's mass is what its SOL is worth, so growing means holding more SOL.
+        if (this.cash) o.v = Math.max(0.05, Math.round(l * CASH_MASS_PER_LAMPORT * 100) / 100);
+      }
       this.orbs.push(o);
       ev.newOrbs.push(o);
     }
+    if (keepBag) p.banked = p.m; else p.bag = 0;
     p.m = 0;
     p.trail = [];
   }
@@ -373,6 +805,15 @@ export class Arena {
   step(dt: number, brain?: (a: Arena, p: Player) => { dx: number; dy: number; boost: boolean }): StepResult {
     const ev: StepResult = { eatenOrbs: [], newOrbs: [], deaths: [] };
     setRules(this.rules);
+    // Bag left behind by a capped cash out: spread over the map in coins of at most one entry.
+    for (const l of this.pendingSpill.splice(0)) {
+      const n = Math.max(1, Math.ceil(l / this.cashMin));
+      for (let i = 0; i < n; i++) {
+        const part = Math.floor(l / n) + (i === 0 ? l % n : 0);
+        const a = this.rng.range(0, Math.PI * 2), d = Math.sqrt(this.rng.next()) * (this.mapR - 120);
+        this.mintCoin(ARENA.w / 2 + Math.cos(a) * d, ARENA.h / 2 + Math.sin(a) * d, part, ev, Math.max(0.05, Math.round(part * CASH_MASS_PER_LAMPORT * 100) / 100));
+      }
+    }
     for (const q of this.pendingAway.splice(0)) {
       const pi = this.players.findIndex((x) => x.w === q.w);
       if (pi < 0) continue;
@@ -380,7 +821,16 @@ export class Arena {
       this.players[pi].protectUntil = Math.max(this.players[pi].protectUntil, this.time + secs);
       if (!this.survival) this.inputLog.push([this.stepN, pi, 0, q.back ? 3 : 2]);
     }
+    for (const q of this.pendingTraps.splice(0)) {
+      this.placeTrap(q.pi, q.kind, ev);
+      if (!this.survival) this.inputLog.push([this.stepN, q.pi, q.kind, 4]);
+    }
     this.time += dt;
+    setLengthCap(!this.survival);
+    if (this.survival) {
+      const want = this.mapTarget();
+      this.mapR += Math.max(-MAP_SHRINK_PER_S * dt, Math.min(MAP_GROW_PER_S * dt, want - this.mapR));
+    }
     const zoneNow = this.zoneNow();
     const cx = zoneNow.cx;
     const cy = zoneNow.cy;
@@ -391,7 +841,8 @@ export class Arena {
     for (let pi = 0; pi < this.players.length; pi++) {
       const p = this.players[pi];
       if (!p.alive) continue;
-      if ((p.bot || p.auto || p.afk) && brain) {
+      // A bot decides every `brainEvery` steps (staggered by seat) and keeps its course in between: the live arenas run many bots.
+      if ((p.bot || p.auto || p.afk) && brain && (this.brainEvery <= 1 || (tickNo + pi) % this.brainEvery === 0)) {
         const a = brain(this, p);
         p.dx = a.dx; p.dy = a.dy; p.boost = a.boost;
       }
@@ -414,10 +865,31 @@ export class Arena {
       const maxTurn = turnRateOf(p.m) * dt;
       p.heading += Math.max(-maxTurn, Math.min(maxTurn, diff));
 
-      let speed = speedOf(p.m);
+      let speed = speedOf(p.m) * (this.traps.length ? this.slowOf(p) : 1) * (p.cashoutAt !== undefined ? 0.5 : 1);
       if (p.boost && p.m > ARENA.minMass) {
         speed *= ARENA.boostSpeed;
-        p.m = Math.max(ARENA.minMass, p.m - p.m * ARENA.boostCostPerSecond * dt);
+        p.m = Math.max(ARENA.minMass, p.m - p.m * boostCostOf() * dt);
+        // Cash arena: boosting costs SOL too, the same share of the bag as of the mass. It is held while you boost and pops out
+        // behind your tail as one coin the moment you stop: the SOL changes hands, it never disappears.
+        if (this.cash && p.bag) {
+          const take = Math.min(p.bag, Math.max(1, Math.ceil(p.bag * boostCostOf() * dt)));
+          p.bag -= take;
+          p.boostSpill = (p.boostSpill ?? 0) + take;
+        }
+      } else if (p.boostSpill) {
+        // The boost is over: its SOL explodes from the head and lands in fractions all over the map.
+        const spill = p.boostSpill;
+        p.boostSpill = 0;
+        const n = Math.max(1, Math.min(12, Math.floor(spill / 20_000)));
+        const cut = unevenSplit(spill, n, this.stepN % 97);
+        const ids: number[] = [];
+        for (let i = 0; i < n; i++) {
+          const a = this.rng.range(0, Math.PI * 2), d = Math.sqrt(this.rng.next()) * Math.max(100, this.mapR - 120);
+          const before = ev.newOrbs.length;
+          this.mintCoin(ARENA.w / 2 + Math.cos(a) * d, ARENA.h / 2 + Math.sin(a) * d, cut.parts[i], ev, Math.max(0.05, Math.round(cut.parts[i] * CASH_MASS_PER_LAMPORT * 100) / 100));
+          if (ev.newOrbs.length > before) ids.push(ev.newOrbs[ev.newOrbs.length - 1].id);
+        }
+        this.pops.push({ w: p.w, x: Math.round(p.x), y: Math.round(p.y), ids });
       }
       const px = p.x, py = p.y;
       p.x += Math.cos(p.heading) * speed * dt;
@@ -435,7 +907,8 @@ export class Arena {
           for (let i = 1; i <= n; i++) {
             p.trail.unshift([last[0] + ux * ARENA.trailSpacing * i, last[1] + uy * ARENA.trailSpacing * i]);
           }
-          const keep = ARENA.maxBodySegments * Math.round(ARENA.segmentSpacing / ARENA.trailSpacing) + 6;
+          // Survival: no length limit, so the path kept follows the body's own length.
+          const keep = this.survival ? Math.round((ARENA.maxBodySegments * segmentSpacingOf(p.m) * (1 + (p.lengthBonus ?? 0))) / ARENA.trailSpacing) + 6 : trailKeep();
           if (p.trail.length > keep) p.trail.length = keep;
         }
       }
@@ -446,11 +919,14 @@ export class Arena {
       if (!p.alive) continue;
       if (p.protectUntil > this.time) {
         // Protected: the edge cannot kill and the zone does not hurt yet; keep the head on the map.
-        p.x = Math.max(0, Math.min(ARENA.w, p.x));
-        p.y = Math.max(0, Math.min(ARENA.h, p.y));
+        if (!this.survival) {
+          p.x = Math.max(0, Math.min(ARENA.w, p.x));
+          p.y = Math.max(0, Math.min(ARENA.h, p.y));
+        }
         continue;
       }
-      if (p.x < 0 || p.y < 0 || p.x > ARENA.w || p.y > ARENA.h) {
+      // Survival has no square wall: its edge is the circle of the map (the zone), which grows and shrinks.
+      if (!this.survival && (p.x < 0 || p.y < 0 || p.x > ARENA.w || p.y > ARENA.h)) {
         this.kill(p, "wall", ev);
         continue;
       }
@@ -466,20 +942,86 @@ export class Arena {
       if (p.alive && p.auto && p.m > ARENA.minMass) p.m = Math.max(ARENA.minMass, p.m * (1 - AWAY_DRAIN_PER_S * dt));
     }
 
+    // Traps: a laser takes a tenth of the mass of a head that touches it (once per head) and gives it to its owner; it never
+    // kills. Not its owner's own head, not a protected one. Old traps go away.
+    if (this.traps.length) {
+      for (const t of this.traps) {
+        if (t.kind !== TRAP_LASER) continue;
+        const owner = this.players.find((q) => q.w === t.owner);
+        for (const p of this.players) {
+          if (!p.alive || p.w === t.owner || p.protectUntil > this.time || t.hit.includes(p.w)) continue;
+          if (segDist(p.x, p.y, t.x, t.y, t.x2, t.y2) < bodyRadius(p.m)) {
+            t.hit.push(p.w);
+            const take = Math.max(0, Math.min(p.m - ARENA.minMass, p.m * TRAP_LASER_TAKE));
+            p.m -= take;
+            if (owner && owner.alive) { owner.m += take; if (owner.m > owner.peak) owner.peak = owner.m; }
+          }
+        }
+      }
+      this.traps = this.traps.filter((t) => t.until > this.time);
+    }
+
+    // Rules 5: the coins the zone leaves outside are part of the pot too. Once a second they fuse, slice by slice of the circle,
+    // into one bigger coin that jumps back inside, so nothing of value is left where nobody can go.
+    if (this.rules >= 5 && tickNo % ARENA.tickRate === 0) this.fuseOutside(cx, cy, zr, ev);
+    // Rules 5: once the zone starts closing, coins lying close together fuse every few seconds, so the last ones are few and big.
+    if (this.rules >= 5 && zoneNow.phase >= 2 && tickNo % (ARENA.tickRate * 4) === 0) this.fuseNear(ev);
+    // Rules 5: the map never holds more coins than its area can show; the smallest ones fuse into their nearest neighbour.
+    if (this.rules >= 5 && !this.survival && tickNo % ARENA.tickRate === 0) this.capCoins(zr, ev);
+    // Cash arena: every 10 s the smallest SOL coins fuse into their nearest SOL coin, so the money on the map grows into fewer, bigger coins.
+    // and every second the map never holds more than CASH_COIN_CAP coins (the server and the screens stay fast however long it runs).
+    if (this.cash && tickNo % ARENA.tickRate === 0) {
+      if (tickNo % (ARENA.tickRate * 10) === 0) this.growCoins(ev, 6, 30);
+      this.growCoins(ev, 40, CASH_COIN_CAP);
+    }
+    // Rules 5, a room paid by bag: the showers of the pot.
+    while (this.bagDrops.length && this.time >= this.bagDrops[0][0]) this.bagShower(this.bagDrops.shift()![1], ev);
+
     // Orbs.
     for (const p of this.players) {
       if (!p.alive || p.auto) continue;
-      const r = bodyRadius(p.m) + 6;
+      const r0 = bodyRadius(p.m) + 6;
       for (let i = this.orbs.length - 1; i >= 0; i--) {
         const o = this.orbs[i];
         const ddx = o.x - p.x;
         const ddy = o.y - p.y;
+        // Cash arena: a coin is eaten when the head touches its drawn edge, so a big coin is eaten as soon as it looks touched.
+        const r = this.cash ? r0 + 1.6 * (3 + 1.6 * Math.sqrt(Math.max(0, o.v))) : r0;
         if (Math.abs(ddx) <= r && Math.abs(ddy) <= r && ddx * ddx + ddy * ddy <= r * r) {
+          // Cash arena: everybody paid to enter, so every orb is for everybody (no mass needed, no orb too small).
+          if (this.survival && !this.cash && !canEatOrb(p.m, o)) continue;
+          // A body cashing out eats nothing more: it is leaving.
+          if (this.cash && p.cashoutAt !== undefined) continue;
           p.m += o.v;
+          if (o.l) p.bag = (p.bag ?? 0) + o.l;
           if (p.m > p.peak) p.peak = p.m;
           ev.eatenOrbs.push(o.id);
           this.orbs.splice(i, 1);
         }
+      }
+    }
+
+    // Rules 6: who is the boss in this step; and the bodies that finished cashing out leave the arena with what they carry.
+    this.bossNow = this.boss();
+    if (this.rules >= 6) {
+      for (const p of this.players) {
+        // Cash arena: while cashing out, the bag flows to the wallet evenly over CASHOUT_S and the body shrinks with it.
+        if (this.cash && p.alive && p.cashoutAt !== undefined && p.cashedBag !== undefined) {
+          const step = Math.min(p.bag ?? 0, Math.ceil(((p.cashBag0 ?? 0) / CASHOUT_S) * dt));
+          if (step > 0) { p.bag = (p.bag ?? 0) - step; p.cashedBag += step; this.cashPaid += step; }
+          // The body shrinks evenly to nothing over the cash out: whoever cashes out leaves the game, never plays on.
+          p.m = Math.max(0.5, (p.cashMass0 ?? p.m) * (1 - Math.min(1, (this.time - p.cashoutAt) / CASHOUT_S)));
+        }
+        if (!p.alive || p.cashoutAt === undefined || this.time - p.cashoutAt < CASHOUT_S) continue;
+        p.banked = p.m;
+        // Cash arena: the bag leaves the arena with its owner.
+        if (this.cash) { const rest = p.bag ?? 0; p.cashedBag = (p.cashedBag ?? 0) + rest; this.cashPaid += rest; p.bag = 0; }
+        p.alive = false;
+        p.diedAt = this.time;
+        p.killer = "cashout";
+        p.cashoutAt = undefined;
+        p.trail = [];
+        ev.deaths.push({ w: p.w, by: "cashout" });
       }
     }
 
@@ -511,11 +1053,38 @@ export class Arena {
         for (let k = 1; k < pts.length; k++) {
           const ddx = a.x - pts[k][0];
           const ddy = a.y - pts[k][1];
-          const lim = rb + ra * 0.35;
+          // Cash arena: the contact you see is the contact that counts, so a big head dies as soon as it touches a body.
+          const lim = this.cash ? rb + ra * 0.8 : rb + ra * 0.35;
           if (ddx * ddx + ddy * ddy < lim * lim) {
             // Survival: a body at least three times heavier (and the team's own) is not killed by a small one's body: it eats
             // a bite of it, which is mass for the big one and a shorter body for the small one.
-            if (this.rules >= 2 && (a.ceo || a.m >= b.m * 3)) {
+            if (this.survival && this.rules >= 3 && !this.cash && (a.ceo || a.m >= b.m * 3)) {
+              // Survival: the tail (its last quarter) of a body five times lighter is food: bit by bit its mass moves to the
+              // big one. Anywhere else, a dominant head is not killed but pays for the knock, more the closer the two are.
+              // Which part was hit: the point nearest to the head, not the first one within reach.
+              let near = k, nd = ddx * ddx + ddy * ddy;
+              for (let j = k + 1; j < pts.length; j++) {
+                const ex = a.x - pts[j][0], ey = a.y - pts[j][1], e = ex * ex + ey * ey;
+                if (e < nd) { nd = e; near = j; }
+              }
+              if (a.m >= b.m * 5 && near >= pts.length * 0.75) {
+                const bite = Math.max(0.3, b.m * 0.012);
+                b.m -= bite;
+                a.m += bite;
+                if (a.m > a.peak) a.peak = a.m;
+                if (b.m < ARENA.deathMass && !dying.has(b.w)) dying.set(b.w, a.w);
+              } else {
+                // One knock per pair per second: a long rub costs one knock a second, not one every tick.
+                const key = `${a.w}|${b.w}`;
+                if ((this.knockAt.get(key) ?? -1) <= this.time - 1) {
+                  this.knockAt.set(key, this.time);
+                  const loss = a.m * Math.min(0.03, Math.max(0.004, (b.m / a.m) * 0.1));
+                  a.m = Math.max(ARENA.minMass, a.m - loss);
+                }
+              }
+              break;
+            }
+            if (this.rules >= 2 && !this.cash && (a.ceo || a.m >= b.m * 3)) {
               const bite = Math.max(0.4, b.m * 0.04);
               b.m -= bite;
               a.m += bite;
@@ -523,6 +1092,7 @@ export class Arena {
               if (b.m < ARENA.deathMass && !dying.has(b.w)) dying.set(b.w, a.w);
               break;
             }
+            if (this.bossBite(a, b, k, pts.length, ev)) break;
             if (!dying.has(a.w)) dying.set(a.w, b.w);
             break;
           }
@@ -534,26 +1104,34 @@ export class Arena {
       if (p) this.kill(p, by, ev);
     }
 
+    // Rules 7: the moment three bodies are left, the zone stops closing for FINAL3_FREEZE_S seconds.
+    if (this.rules >= 7 && !this.survival && this.freezeAt < 0 && this.aliveCount() <= 3) this.freezeAt = this.time;
+
     // Airdrop: a cluster of rich coins somewhere inside the zone.
-    if (this.time >= this.nextDrop) {
+    if (this.time >= this.nextDrop && !this.bagMode) {
       this.nextDrop += this.survival ? 12 : ARENA.airdropEveryS;
       this.dropAt = { x: 0, y: 0, t: this.time };
       const z = this.zone();
-      const a = this.rng.range(0, Math.PI * 2);
-      const rr = Math.sqrt(this.rng.next()) * Math.max(0, z.r - 160);
+      const fixed = this.rules >= 4;
+      const dn = this.dropSeq++;
+      const [da, dr] = spread(dn + 7);
+      const a = fixed ? da : this.rng.range(0, Math.PI * 2);
+      const rr = (fixed ? 0.2 + 0.6 * dr : Math.sqrt(this.rng.next())) * Math.max(0, z.r - 160);
       const cx = z.cx + Math.cos(a) * rr, cy = z.cy + Math.sin(a) * rr;
       if (this.dropAt) { this.dropAt.x = Math.round(cx); this.dropAt.y = Math.round(cy); }
       for (let i = 0; i < (this.survival ? 9 : ARENA.airdropOrbs); i++) {
-        const t = this.rng.range(0, Math.PI * 2), d = this.rng.range(0, 70);
+        const t = fixed ? (i * Math.PI * 2) / 9 : this.rng.range(0, Math.PI * 2), d = fixed ? 45 : this.rng.range(0, 70);
         const o: Orb = { id: this.nextOrbId++, x: Math.round(cx + Math.cos(t) * d), y: Math.round(cy + Math.sin(t) * d), v: ARENA.airdropValue };
         this.orbs.push(o);
         ev.newOrbs.push(o);
       }
     }
 
+    // Survival: big coins for big bodies, as many as there are bodies to eat them.
+    if (this.survival && !this.bagMode) this.stockTiers(ev);
     // Keep the map stocked.
-    let mapOrbs = this.orbs.length;
-    while (mapOrbs < this.foodTarget()) {
+    let mapOrbs = this.survival ? this.orbs.reduce((n, o) => n + (o.tier ? 0 : 1), 0) : this.orbs.length;
+    while (!this.bagMode && mapOrbs < this.foodTarget()) {
       const o = this.newOrb();
       this.orbs.push(o);
       ev.newOrbs.push(o);
@@ -561,6 +1139,189 @@ export class Arena {
     }
     if (this.survival) this.respawnBots();
     return ev;
+  }
+
+  /** Rules 7: when the zone froze for the last three (-1 until then), and the clock the zone follows (it skips the freeze). */
+  freezeAt = -1;
+  zoneTime(): number {
+    if (this.freezeAt < 0) return this.time;
+    return this.time < this.freezeAt + FINAL3_FREEZE_S ? this.freezeAt : this.time - FINAL3_FREEZE_S;
+  }
+  /** Rules 7: seconds left of the freeze of the last three, or 0. */
+  freezeLeft(): number {
+    return this.freezeAt < 0 ? 0 : Math.max(0, this.freezeAt + FINAL3_FREEZE_S - this.time);
+  }
+
+  /** Rules 5, a room paid by bag: the pot (lamports) still to fall as showers, [time in seconds, lamports]. */
+  private bagDrops: [number, number][] = [];
+  private bagSeq = 0;
+  /** Rules 8: a room paid by bag, where every orb on the map is a coin of the pot (set by mintBags). */
+  bagMode = false;
+  /** Lamports minted into coins so far (equal to the pot once every shower fell). */
+  bagMinted = 0;
+  /**
+   * Rules 5, a room paid by bag: the pot becomes coins. 30 percent falls at once over the zone, the other 70 in equal showers
+   * every 15 seconds until 70 percent of the match. Every lamport is in exactly one coin; nothing is created.
+   */
+  mintBags(pool: number): StepResult {
+    const ev: StepResult = { eatenOrbs: [], newOrbs: [], deaths: [] };
+    if (this.rules < 5 || pool <= 0) return ev;
+    const first = Math.floor(pool * 0.3);
+    // Rules 8: the map holds only the pot. The free food goes and the pot falls in more, smaller coins.
+    if (this.rules >= 8) {
+      this.bagMode = true;
+      for (const o of this.orbs) ev.eatenOrbs.push(o.id);
+      this.orbs.length = 0;
+    }
+    const z = this.zone();
+    const N = this.rules >= 8 ? 150 : 40;
+    const cut = this.rules >= 8 ? unevenSplit(first, N, 3) : null;
+    for (let i = 0; i < N; i++) {
+      const [a, r] = spread(i + 501);
+      const l = cut ? cut.parts[i] : Math.floor(first / N) + (i === 0 ? first % N : 0);
+      // Rules 8: a coin is as big as it is rich (its mass follows its weight).
+      const v = cut ? Math.round(Math.min(10, Math.max(1, (3 * cut.weights[i] * N) / cut.weights.reduce((x, y) => x + y, 0))) * 10) / 10 : 3;
+      this.mintCoin(z.cx + Math.cos(a) * r * (z.r - 80), z.cy + Math.sin(a) * r * (z.r - 80), l, ev, v);
+    }
+    const until = (this.matchMs / 1000) * 0.7;
+    const times: number[] = [];
+    for (let t = 15; t <= until; t += 15) times.push(t);
+    if (!times.length) times.push(1);
+    const rest = pool - first;
+    this.bagDrops = times.map((t, i) => [t, Math.floor(rest / times.length) + (i === 0 ? rest % times.length : 0)]);
+    return ev;
+  }
+  private mintCoin(x: number, y: number, l: number, ev: StepResult, v = 3): void {
+    if (l <= 0) return;
+    const o: Orb = { id: this.nextOrbId++, x: Math.round(x), y: Math.round(y), v, l, c: "SOL", q: l / 1e9 };
+    this.bagMinted += l;
+    this.orbs.push(o);
+    ev.newOrbs.push(o);
+  }
+  /** A shower of the pot: eight coins in a ring at a fixed spot of the zone. */
+  private bagShower(total: number, ev: StepResult): void {
+    const z = this.zone();
+    const [a, r] = spread(this.bagSeq++ + 701);
+    const cx = z.cx + Math.cos(a) * r * Math.max(0, z.r - 160), cy = z.cy + Math.sin(a) * r * Math.max(0, z.r - 160);
+    const N = this.rules >= 8 ? 20 : 8;
+    const cut = this.rules >= 8 ? unevenSplit(total, N, this.bagSeq * 7) : null;
+    for (let i = 0; i < N; i++) {
+      const t = (i * Math.PI * 2) / N;
+      const v = cut ? Math.round(Math.min(10, Math.max(1, (3 * cut.weights[i] * N) / cut.weights.reduce((x, y) => x + y, 0))) * 10) / 10 : 3;
+      this.mintCoin(cx + Math.cos(t) * 50, cy + Math.sin(t) * 50, cut ? cut.parts[i] : Math.floor(total / N) + (i === 0 ? total % N : 0), ev, v);
+    }
+  }
+  /** Rules 5: how many coins the safe zone holds, in proportion to its area (600 on the full map, 40 at least). */
+  coinCap(zr: number): number {
+    return Math.max(40, Math.round(ARENA.orbTarget * (zr / ARENA.zoneR0) ** 2));
+  }
+  /** Rules 5: while the map holds more coins than the cap, the smallest coin fuses into the nearest one (value and lamports added). */
+  private capCoins(zr: number, ev: StepResult): void {
+    let extra = this.orbs.length - this.coinCap(zr);
+    while (extra-- > 0 && this.orbs.length > 1) {
+      let si = 0;
+      for (let i = 1; i < this.orbs.length; i++) {
+        const o = this.orbs[i], b = this.orbs[si];
+        if (o.v < b.v || (o.v === b.v && o.id < b.id)) si = i;
+      }
+      const a = this.orbs[si];
+      let ni = -1, nd = Infinity;
+      for (let i = 0; i < this.orbs.length; i++) {
+        if (i === si) continue;
+        const d = (this.orbs[i].x - a.x) ** 2 + (this.orbs[i].y - a.y) ** 2;
+        if (d < nd) { nd = d; ni = i; }
+      }
+      const b = this.orbs[ni];
+      const l = (a.l ?? 0) + (b.l ?? 0);
+      const o: Orb = { id: this.nextOrbId++, x: b.x, y: b.y, v: a.v + b.v, loot: true };
+      if (l) { o.l = l; o.c = "SOL"; o.q = l / 1e9; }
+      ev.eatenOrbs.push(a.id, b.id);
+      this.orbs.splice(Math.max(si, ni), 1);
+      this.orbs.splice(Math.min(si, ni), 1);
+      this.orbs.push(o);
+      ev.newOrbs.push(o);
+    }
+  }
+
+  /** Cash arena: up to 6 of the smallest SOL coins fuse each into its nearest SOL coin (lamports added, mass follows the SOL), while
+   *  more than 30 SOL coins lie on the map. Nothing is created or lost: the lamports of the two become the one. */
+  private growCoins(ev: StepResult, merges: number, keep: number): void {
+    for (let k = 0; k < merges; k++) {
+      const sol = this.orbs.filter((o) => (o.l ?? 0) > 0);
+      if (sol.length <= keep) return;
+      let a = sol[0];
+      for (const o of sol) if ((o.l ?? 0) < (a.l ?? 0) || ((o.l ?? 0) === (a.l ?? 0) && o.id < a.id)) a = o;
+      // Never a coin worth more than one entry of this arena: the nearest coin it can join without passing that.
+      let b: Orb | null = null, nd = Infinity;
+      for (const o of sol) { if (o === a || (a.l ?? 0) + (o.l ?? 0) > this.cashMin) continue; const d = (o.x - a.x) ** 2 + (o.y - a.y) ** 2; if (d < nd) { nd = d; b = o; } }
+      if (!b) return;
+      const l = (a.l ?? 0) + (b.l ?? 0);
+      const o: Orb = { id: this.nextOrbId++, x: b.x, y: b.y, v: Math.max(0.05, Math.round(l * CASH_MASS_PER_LAMPORT * 100) / 100), l, c: "SOL", q: l / 1e9, loot: true };
+      (ev.fuses ??= []).push([a.x, a.y, b.x, b.y]);
+      ev.eatenOrbs.push(a.id, b.id);
+      this.orbs = this.orbs.filter((x) => x !== a && x !== b);
+      this.orbs.push(o);
+      ev.newOrbs.push(o);
+    }
+  }
+
+  /** Rules 5: coins lying within 60 units of each other fuse into the bigger one's spot (value and lamports added). */
+  private fuseNear(ev: StepResult): void {
+    const R2 = 60 * 60;
+    const gone = new Set<number>();
+    const out: Orb[] = [];
+    for (let i = 0; i < this.orbs.length; i++) {
+      const a = this.orbs[i];
+      if (gone.has(a.id) || a.tier) continue;
+      let group: Orb[] | null = null;
+      for (let j = i + 1; j < this.orbs.length; j++) {
+        const b = this.orbs[j];
+        if (gone.has(b.id) || b.tier) continue;
+        const dx = a.x - b.x, dy = a.y - b.y;
+        if (dx * dx + dy * dy <= R2) { (group ??= [a]).push(b); gone.add(b.id); }
+      }
+      if (!group) continue;
+      gone.add(a.id);
+      const big = group.reduce((m, o) => (o.v > m.v ? o : m), group[0]);
+      const v = group.reduce((n, o) => n + o.v, 0);
+      const l = group.reduce((n, o) => n + (o.l ?? 0), 0);
+      const o: Orb = { id: this.nextOrbId++, x: big.x, y: big.y, v, loot: true };
+      if (l) { o.l = l; o.c = "SOL"; o.q = l / 1e9; }
+      out.push(o);
+    }
+    if (!gone.size) return;
+    for (let i = this.orbs.length - 1; i >= 0; i--) if (gone.has(this.orbs[i].id)) { ev.eatenOrbs.push(this.orbs[i].id); this.orbs.splice(i, 1); }
+    for (const o of out) { this.orbs.push(o); ev.newOrbs.push(o); }
+  }
+
+  /** Rules 5: the orbs outside the zone fuse by slice of the circle (16 slices) into one orb a little inside the edge. */
+  private fuseOutside(cx: number, cy: number, zr: number, ev: StepResult): void {
+    const SLICES = 16;
+    const groups = new Map<number, Orb[]>();
+    for (let i = this.orbs.length - 1; i >= 0; i--) {
+      const o = this.orbs[i];
+      if (Math.hypot(o.x - cx, o.y - cy) <= zr) continue;
+      const s = Math.floor((Math.atan2(o.y - cy, o.x - cx) / (Math.PI * 2) + 1) * SLICES) % SLICES;
+      const list = groups.get(s);
+      if (list) list.push(o); else groups.set(s, [o]);
+      ev.eatenOrbs.push(o.id);
+      this.orbs.splice(i, 1);
+    }
+    const inner = Math.max(0, zr - 140);
+    for (const [s, list] of [...groups].sort((a, b) => a[0] - b[0])) {
+      const a = ((s + 0.5) / SLICES) * Math.PI * 2;
+      const v = list.reduce((n, o) => n + o.v, 0);
+      const l = list.reduce((n, o) => n + (o.l ?? 0), 0);
+      const o: Orb = { id: this.nextOrbId++, x: Math.round(cx + Math.cos(a) * inner), y: Math.round(cy + Math.sin(a) * inner), v, loot: true };
+      if (l) { o.l = l; o.c = "SOL"; o.q = l / 1e9; }
+      // A coin of the market keeps the name of its biggest piece, and an amount worth the whole fused value.
+      const big = list.reduce((m, o) => (o.v > m.v ? o : m), list[0]);
+      if (!l && big.c && big.q) { o.c = big.c; o.q = (big.q * v) / big.v; }
+      const tier = list.reduce((m, o) => Math.max(m, o.tier ?? 0), 0);
+      if (tier) o.tier = tier;
+      this.orbs.push(o);
+      ev.newOrbs.push(o);
+    }
   }
 
   /** Alive players by mass, then dead players by time of death (later is better). Ties: lower wallet. */
@@ -587,12 +1348,57 @@ export class Arena {
   }
 
   /** Puts a body back in the arena, small, protected for a moment, on the spot (out of a dozen tried) farthest from every body. */
+  /**
+   * Cash arena (the live arena on the test network): every body that hits another body dies, big or small. A person enters with
+   * an amount: 97 percent of it falls on the map as coins of different sizes, 3 percent goes to the house, and the person starts
+   * small with an empty bag. Cashing out needs CASH_KILLS eliminations of players who entered with at least as much.
+   */
+  cash = false;
+  /** Cash arena: boosts that just ended, their head and the coins their SOL became (told to the screens once, then cleared). */
+  pops: { w: string; x: number; y: number; ids: number[] }[] = [];
+  cashHouse = 0;
+  cashPaid = 0;
+  /** Cash arena tallies for the info panel: entries paid (count and lamports), eliminations, cash outs, the killers' 15% and players who left. */
+  cashIn = 0;
+  cashEntries = 0;
+  cashKills = 0;
+  cashOuts = 0;
+  cashCut = 0;
+  cashLeft = 0;
+  /** Cash arena: the most a body can cash out now (its entry times one plus its qualifying eliminations). */
+  cashCap(p: Player): number { return (p.entry ?? this.cashMin) * (1 + (p.qk ?? 0)); }
+  /** Cash arena: bag above the cash out cap, to fall over the map at the next step. */
+  private pendingSpill: number[] = [];
+  /** Cash arena: the entry of this arena (a bot that has not paid counts as having entered with it). */
+  cashMin = CASH_MIN_ENTRY;
+  entryOf(p: Player): number { return p.entry ?? (p.bot ? this.cashMin : 0); }
+  cashEnter(p: Player, entry: number): StepResult {
+    const ev: StepResult = { eatenOrbs: [], newOrbs: [], deaths: [] };
+    // The bag is kept: whatever it ate before its entry was confirmed is real SOL from the map and stays its own.
+    p.entry = entry; p.qk = 0; p.bag = p.bag ?? 0; p.cashedBag = undefined;
+    this.cashIn += entry; this.cashEntries++;
+    const fee = Math.floor((entry * 3) / 100);
+    this.cashHouse += fee;
+    const n = Math.max(6, Math.min(40, Math.round(entry / 300_000)));
+    const cut = unevenSplit(entry - fee, n, Math.floor(this.time * 7) % 97);
+    for (let i = 0; i < n; i++) {
+      const a = this.rng.range(0, Math.PI * 2), d = Math.sqrt(this.rng.next()) * (this.mapR - 120);
+      // A coin's mass is what its SOL is worth (CASH_MASS_PER_LAMPORT).
+      const v = Math.max(0.05, Math.round(cut.parts[i] * CASH_MASS_PER_LAMPORT * 100) / 100);
+      this.mintCoin(ARENA.w / 2 + Math.cos(a) * d, ARENA.h / 2 + Math.sin(a) * d, cut.parts[i], ev, v);
+    }
+    return ev;
+  }
+
   private placeSafely(p: Player, protectS: number): void {
     const cx = ARENA.w / 2, cy = ARENA.h / 2;
     let x = cx, y = cy, clear = -1;
     for (let tries = 0; tries < 12; tries++) {
-      const ang = this.rng.range(0, Math.PI * 2);
-      const rad = ARENA.zoneR0 * (0.25 + 0.6 * this.rng.next());
+      const fixed = this.rules >= 4;
+      const sq = this.placeSeq++;
+      const [pa, pr] = spread(sq + 13);
+      const ang = fixed ? pa : this.rng.range(0, Math.PI * 2);
+      const rad = (this.survival ? this.mapR : ARENA.zoneR0) * (0.25 + 0.6 * (fixed ? pr : this.rng.next()));
       const px = cx + Math.cos(ang) * rad, py = cy + Math.sin(ang) * rad;
       let nearest = Infinity;
       for (const o of this.players) {
@@ -609,7 +1415,7 @@ export class Arena {
     }
     p.alive = true; p.m = ARENA.startMass; p.peak = ARENA.startMass;
     p.x = x; p.y = y; p.heading = heading; p.dx = Math.cos(heading); p.dy = Math.sin(heading); p.boost = false;
-    p.trail = trail; p.protectUntil = this.time + protectS; p.diedAt = -1; p.killer = "";
+    p.trail = trail; p.protectUntil = this.time + protectS; p.diedAt = -1; p.killer = ""; p.lengthBonus = 0;
   }
 
   /** The person hands the body to the elite bot, or takes it back. */
@@ -631,6 +1437,7 @@ export class Arena {
 
   /** The slot goes back to a bot with its own fixed address; if the body is dead the bot comes back on its own. */
   release(p: Player, w: string, n: string): void {
+    p.entry = undefined; p.qk = 0;
     p.w = w;
     p.n = n;
     p.bot = true;
@@ -666,6 +1473,8 @@ const LEVELS: Readonly<Record<Difficulty, BotLevel>> = {
   hard: { turn: 0.85, hunt: 0.67, huntRange: 480, avoid: 1, look2: true, wobble: 0, boost: true, chase: false, encircle: false, herd: true, win: true, loot: 3.6, orbRange: 700 },
   insane: { turn: 1, hunt: 1, huntRange: 760, avoid: 1.25, look2: true, wobble: 0, boost: true, chase: true, encircle: true, herd: true, win: true, loot: 4.6, orbRange: 900 },
 };
+/** CEO mode (AFK): the best bot, but staying alive comes first: wider margins, a third look further ahead, and no ring
+ *  hunting (circling a prey is where a body gets cut off). */
 const levelOf = new WeakMap<Arena, Difficulty>();
 /** Set once, for a practice match: its bots play at that level. Rooms with money keep the default (hard). */
 export function setBotDifficulty(a: Arena, d: Difficulty): void { levelOf.set(a, d); }
@@ -673,10 +1482,11 @@ export const isDifficulty = (v: unknown): v is Difficulty => v === "easy" || v =
 
 export function arenaBrain(a: Arena, me: Player): { dx: number; dy: number; boost: boolean } {
   setRules(a.rules);
+  if (me.afk) return ceoBrain(a, me);
   let st = brainMem.get(me);
   if (!st) { st = { orb: -1, until: 0, ang: me.heading, side: 0, d0: 0, t0: 0, ban: new Map(), prey: "", preyUntil: 0, circDir: 1, encT: 0 }; brainMem.set(me, st); }
   // A body played for its person (AFK) plays like the best bot there is.
-  const P = LEVELS[me.afk ? "insane" : levelOf.get(a) ?? "hard"];
+  const P = LEVELS[levelOf.get(a) ?? "hard"];
   const zone = a.zone();
   const cx = zone.cx, cy = zone.cy, zr = zone.r;
   const bodyR = bodyRadius(me.m);
@@ -684,9 +1494,14 @@ export function arenaBrain(a: Arena, me: Player): { dx: number; dy: number; boos
 
   // The others: head and body points once per call.
   const others: { w: string; pts: [number, number][]; r: number; heavier: boolean; hx: number; hy: number; prot: boolean; hd: number; m: number }[] = [];
+  // The live arenas (many bots, `brainEvery` > 1) look only at what is near: body points within 800 of the head, far beyond any
+  // reach the brain tests, and the points of each body are worked out once per step for every bot.
+  const light = a.brainEvery > 1;
   for (const o of a.players) {
     if (o === me || !o.alive) continue;
-    others.push({ w: o.w, hd: o.heading, m: o.m, pts: bodyPoints(o).filter((_, k) => k % 2 === 0), r: bodyRadius(o.m), heavier: o.m > me.m * 0.95, hx: o.x, hy: o.y, prot: o.protectUntil > a.time });
+    let pts = light ? a.halfPoints(o) : bodyPoints(o).filter((_, k) => k % 2 === 0);
+    if (light) { pts = pts.filter((q) => Math.abs(q[0] - me.x) < 800 && Math.abs(q[1] - me.y) < 800); if (!pts.length && Math.hypot(o.x - me.x, o.y - me.y) > 800) continue; }
+    others.push({ w: o.w, hd: o.heading, m: o.m, pts, r: bodyRadius(o.m), heavier: o.m > me.m * 0.95, hx: o.x, hy: o.y, prot: o.protectUntil > a.time });
   }
 
   // Where it wants to go: back inside when the zone is close, else the best orb it has committed to.
@@ -707,14 +1522,16 @@ export function arenaBrain(a: Arena, me: Player): { dx: number; dy: number; boos
       target = undefined;
       for (const o of a.orbs) {
         const d = Math.hypot(o.x - me.x, o.y - me.y);
-        if (d > (o.loot ? P.orbRange * 1.4 : P.orbRange)) continue;
+        if (d > (a.cash && (o.l ?? 0) > 0 ? P.orbRange * 2.2 : o.loot ? P.orbRange * 1.4 : P.orbRange)) continue;
         if ((st.ban.get(o.id) ?? 0) > a.time) continue;
         const turn = Math.abs(angDiff(Math.atan2(o.y - me.y, o.x - me.x), st.ang));
         // What a body left behind is worth more than its mass: it is free food, and somebody else is going for it.
         // A pile of food in the middle of three bigger bodies is not worth it: the more dangerous heads near an orb, the less it is worth.
         let risk = 0;
         for (const q of others) { if (q.heavier && Math.hypot(q.hx - o.x, q.hy - o.y) < 260) risk++; }
-        const sc = (1 + o.v * (o.loot ? P.loot : 1)) / ((d + 60) * (1 + 0.9 * risk)) - turn * 0.0009;
+        // Cash arena: a coin with SOL is what the game is about; a bot wants it far more than plain food.
+        const rich = a.cash && (o.l ?? 0) > 0 ? 8 : 1;
+        const sc = (1 + o.v * (o.loot ? P.loot : 1)) * rich / ((d + 60) * (1 + 0.9 * risk)) - turn * 0.0009;
         if (sc > bestScore) { bestScore = sc; target = o; }
       }
       if (target) { st.orb = target.id; st.until = a.time + 1.6 + ((target.id * 31) % 7) * 0.1; st.d0 = Math.hypot(target.x - me.x, target.y - me.y); st.t0 = a.time; }
@@ -785,9 +1602,15 @@ export function arenaBrain(a: Arena, me: Player): { dx: number; dy: number; boos
     for (const reach of P.look2 ? [70 + bodyR * 2, 170 + bodyR * 3] : [70 + bodyR * 2]) {
       const tx = me.x + Math.cos(ang) * reach, ty = me.y + Math.sin(ang) * reach;
       const w = reach < 100 ? 1 : 0.5;
-      if (tx < 30 || ty < 30 || tx > ARENA.w - 30 || ty > ARENA.h - 30) cost += 900 * w;
+      if (!a.survival && (tx < 30 || ty < 30 || tx > ARENA.w - 30 || ty > ARENA.h - 30)) cost += 900 * w;
       const dz = Math.hypot(tx - cx, ty - cy);
       if (dz > zr - 30) cost += (240 + (dz - (zr - 30))) * w;
+      // Somebody else's laser takes a tenth of the mass, a puddle slows: both are worth a detour.
+      for (const t of a.traps) {
+        if (t.owner === me.w) continue;
+        if (t.kind === TRAP_LASER && segDist(tx, ty, t.x, t.y, t.x2, t.y2) < bodyR + 30) cost += 300 * w;
+        else if (t.kind === TRAP_SLOW && Math.hypot(tx - t.x, ty - t.y) < t.r) cost += 120 * w;
+      }
       for (const o of others) {
         const lim = o.r + bodyR + (o.heavier ? 38 : 22);
         // Its head is the dangerous part: a body segment only hurts if it is crossed, a head can come at you.
@@ -813,4 +1636,165 @@ export function arenaBrain(a: Arena, me: Player): { dx: number; dy: number; boos
   // A burst only to get away from a heavier head that is on top of it, and only with mass to spare.
   const boost = P.boost && me.m > 40 && (fleeThreat > 0.35 || (P.chase && chasing && me.m > 70));
   return { dx: Math.cos(st.ang), dy: Math.sin(st.ang), boost };
+}
+
+// ───────────── CEO mode: the best player there is, under the same rules as everybody ─────────────
+// It looks ahead instead of reacting: every tick it simulates 24 headings, with and without the boost, 1.4 seconds into the future,
+// with the turning limit of its mass. Each path is scored by what would happen on it: crossing a body or meeting a heavier (or
+// equal) head head on is fatal, leaving the zone costs, open space ahead is worth a lot (so an encircling ring is left through its
+// widest gap before it closes), a lighter head on the path is a kill. The boost costs mass like for anybody, so it is used only
+// to get out of danger or to close on prey worth more than what the burst burns.
+const ceoMem = new WeakMap<Player, { ang: number; orb: number; orbUntil: number }>();
+const CEO_DIRS = 24;
+const CEO_T = 1.4;
+const CEO_DT = 0.1;
+/** Weights of the CEO brain (exported so a simulation can tune them). */
+export const CEO_K = { goal: 420, open: 1.5, preyRange: 1100, preyBonus: 2500, orbRange: 1600, risk: 1.2 };
+
+export function ceoBrain(a: Arena, me: Player): { dx: number; dy: number; boost: boolean } {
+  let st = ceoMem.get(me);
+  if (!st) { st = { ang: me.heading, orb: -1, orbUntil: 0 }; ceoMem.set(me, st); }
+  const zone = a.zone();
+  const R = bodyRadius(me.m);
+  const v = speedOf(me.m);
+  const canBoost = me.m > ARENA.minMass + 15;
+  const vB = v * ARENA.boostSpeed;
+  const turnRate0 = turnRateOf(me.m);
+  // A big body turns wide: it looks further ahead and keeps its whole turning circle (and then some) inside the zone.
+  const horizon = Math.min(3.2, Math.max(CEO_T, (Math.PI / turnRate0) * 0.9));
+  const steps = Math.round(horizon / CEO_DT);
+  const turnR = v / turnRate0;
+  const edgeMargin = R + turnR * 1.4 + 160;
+  const near = vB * horizon + 450;
+
+  // The others: their head, where it is going, and only the body points close enough to matter.
+  type O = { w: string; m: number; r: number; hx: number; hy: number; vx: number; vy: number; pts: [number, number][]; tailPts: [number, number][]; danger: boolean; prey: boolean; knock: boolean };
+  const os: O[] = [];
+  for (const o of a.players) {
+    if (o === me || !o.alive) continue;
+    const pts: [number, number][] = [];
+    const tailPts: [number, number][] = [];
+    const bp = bodyPoints(o);
+    const tailFrom = bp.length * 0.75;
+    for (let k = 1; k < bp.length; k++) {
+      if (Math.abs(bp[k][0] - me.x) >= near || Math.abs(bp[k][1] - me.y) >= near) continue;
+      (a.survival && me.m >= o.m * 5 && k >= tailFrom ? tailPts : pts).push(bp[k]);
+    }
+    const dh = Math.hypot(o.x - me.x, o.y - me.y);
+    if (pts.length === 0 && tailPts.length === 0 && dh > near) continue;
+    const sp = speedOf(o.m) * (o.boost ? ARENA.boostSpeed : 1);
+    const protectedNow = o.protectUntil > a.time;
+    os.push({
+      w: o.w, m: o.m, r: bodyRadius(o.m), hx: o.x, hy: o.y, vx: Math.cos(o.heading) * sp, vy: Math.sin(o.heading) * sp, pts, tailPts,
+      // Survival: three times heavier, its body is a knock that costs mass, not a death.
+      knock: a.survival && me.m >= o.m * 3,
+      danger: o.m >= me.m * 0.98 || protectedNow, prey: !protectedNow && o.m * 1.1 < me.m,
+    });
+  }
+
+  // What it wants: the best lighter head within reach (aimed where it will be), else the richest food that is safe to take.
+  let goal: { x: number; y: number } | null = null;
+  let preyWorth = 0;
+  let bestPrey = 0;
+  for (const o of os) {
+    if (!o.prey) continue;
+    const d = Math.hypot(o.hx - me.x, o.hy - me.y);
+    if (d > CEO_K.preyRange) continue;
+    if (Math.hypot(o.hx - zone.cx, o.hy - zone.cy) > zone.r - edgeMargin) continue;
+    const score = o.m / (d + 120);
+    if (score > bestPrey) {
+      bestPrey = score;
+      const lead = Math.min(1.2, d / vB);
+      goal = { x: o.hx + o.vx * lead, y: o.hy + o.vy * lead };
+      preyWorth = o.m;
+    }
+  }
+  if (!goal) {
+    let target = a.orbs.find((o) => o.id === st!.orb);
+    if (!target || a.time > st.orbUntil) {
+      let best = -Infinity;
+      target = undefined;
+      for (const o of a.orbs) {
+        const d = Math.hypot(o.x - me.x, o.y - me.y);
+        if (d > CEO_K.orbRange) continue;
+        if (Math.hypot(o.x - zone.cx, o.y - zone.cy) > zone.r - edgeMargin) continue;
+        if (a.survival && !canEatOrb(me.m, o)) continue;
+        let risk = 0;
+        for (const q of os) if (q.danger && Math.hypot(q.hx - o.x, q.hy - o.y) < 300) risk++;
+        const sc = (1 + o.v * (o.loot ? 4 : 1)) / ((d + 60) * (1 + CEO_K.risk * risk));
+        if (sc > best) { best = sc; target = o; }
+      }
+      if (target) { st.orb = target.id; st.orbUntil = a.time + 1.5; }
+    }
+    goal = target ? { x: target.x, y: target.y } : { x: zone.cx, y: zone.cy };
+  }
+  const goalAng = Math.atan2(goal.y - me.y, goal.x - me.x);
+  const turnRate = turnRate0;
+
+  let bestCost = Infinity, bestAng = st.ang, bestBoost = false, safeWithout = Infinity;
+  for (let k = 0; k < CEO_DIRS; k++) {
+    const ang = st.ang + angDiff((k * Math.PI * 2) / CEO_DIRS, 0) ;
+    for (const boost of canBoost ? [false, true] : [false]) {
+      const sp = boost ? vB : v;
+      let x = me.x, y = me.y, h = st.ang, cost = 0;
+      let hitAt = -1;
+      for (let i = 1; i <= steps && hitAt < 0; i++) {
+        const t = i * CEO_DT;
+        const d = angDiff(ang, h);
+        h += Math.max(-turnRate * CEO_DT, Math.min(turnRate * CEO_DT, d));
+        x += Math.cos(h) * sp * CEO_DT;
+        y += Math.sin(h) * sp * CEO_DT;
+        const urgency = 1.6 - t / horizon;
+        for (const o of os) {
+          const lim = R + o.r * 0.9 + 8;
+          for (const pt of o.pts) {
+            if (Math.abs(pt[0] - x) < lim && Math.abs(pt[1] - y) < lim && Math.hypot(pt[0] - x, pt[1] - y) < lim) {
+              if (o.knock) { cost += (2500 + me.m * 0.03 * 25) * urgency; break; }
+              hitAt = t; break;
+            }
+          }
+          if (hitAt >= 0) break;
+          for (const pt of o.tailPts) if (Math.hypot(pt[0] - x, pt[1] - y) < lim) { cost -= o.m * 0.4 * urgency; break; }
+          const px = o.hx + o.vx * t, py = o.hy + o.vy * t;
+          const dh = Math.hypot(px - x, py - y);
+          if (dh < R + o.r + 14) {
+            if (o.danger) { hitAt = t; break; }
+            if (o.prey) cost -= CEO_K.preyBonus * urgency;
+          } else if (o.danger && dh < R + o.r + 90) cost += 300 * urgency * (1 - (dh - R - o.r - 14) / 76);
+        }
+        if (hitAt >= 0) { cost += 20_000 * urgency; break; }
+        // The edge: past the margin it costs, past the zone itself it is as bad as a crash (the zone eats a big body fast).
+        const dz = Math.hypot(x - zone.cx, y - zone.cy);
+        if (dz > zone.r - R) { cost += 20_000 * urgency; hitAt = t; }
+        else if (dz > zone.r - edgeMargin) cost += (900 + (dz - zone.r + edgeMargin) * 25) * urgency;
+      }
+      // Open space beyond the horizon: how far it could keep going this way before meeting a body.
+      if (hitAt < 0) {
+        let free = 0;
+        const ux = Math.cos(h), uy = Math.sin(h);
+        outer: for (let s2 = 40; s2 <= 640; s2 += 40) {
+          const qx = x + ux * s2, qy = y + uy * s2;
+          if (Math.hypot(qx - zone.cx, qy - zone.cy) > zone.r - edgeMargin) break;
+          for (const o of os) for (const pt of o.pts) if (Math.abs(pt[0] - qx) < R + o.r && Math.abs(pt[1] - qy) < R + o.r) break outer;
+          free = s2;
+        }
+        cost -= free * CEO_K.open;
+      }
+      cost += Math.abs(angDiff(ang, goalAng)) * CEO_K.goal;
+      cost += Math.abs(angDiff(ang, st.ang)) * 25;
+      // The burst burns mass: worth it only to get out of danger or to close on prey richer than what it burns.
+      if (boost) {
+        const burn = me.m * boostCostOf() * horizon;
+        cost += burn * 40;
+        if (preyWorth > 0 && Math.abs(angDiff(ang, goalAng)) < 0.5) cost -= Math.min(preyWorth, 4 * burn) * 25;
+      }
+      if (cost < bestCost) { bestCost = cost; bestAng = ang; bestBoost = boost; }
+      if (!boost && hitAt < 0 && cost < safeWithout) safeWithout = cost;
+    }
+  }
+  // Never burn mass when a calm path is just as good.
+  if (bestBoost && safeWithout < bestCost + 60) bestBoost = false;
+  const step = turnRate / ARENA.tickRate;
+  st.ang += Math.max(-step, Math.min(step, angDiff(bestAng, st.ang)));
+  return { dx: Math.cos(st.ang), dy: Math.sin(st.ang), boost: bestBoost };
 }

@@ -1,4 +1,7 @@
+import { ticketsOf } from "./cash-vault.js";
+import { Arena, CASH_MIN_ENTRY } from "./game/arena.js";
 import crypto from "node:crypto";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import http from "node:http";
 import { WebSocketServer } from "ws";
 import { authorityPubkey, syncHouseWallets } from "./chain.js";
@@ -8,6 +11,7 @@ import { startCounters, flush } from "./counters.js";
 import { handleIdeas, startIdeas, flushIdeas, limited, realIp } from "./ideas.js";
 import { statsOf } from "./referrals.js";
 import { maintenancePublic, setMaintenance, startMaintenance } from "./maintenance.js";
+import { clipById, recentClips } from "./var-clips.js";
 import { matchById, matchByTx, matchesByHash, matchesOfWallet, recentMatches, storedReplay } from "./archive.js";
 import { assertKeysSeparated } from "./keys.js";
 import { handleRpc } from "./rpcProxy.js";
@@ -30,7 +34,16 @@ async function cachedJson(key: string, ttlMs: number, compute: () => Promise<unk
   return body;
 }
 
+const loopDelay = monitorEventLoopDelay({ resolution: 10 });
+loopDelay.enable();
 const server = http.createServer((req, res) => {
+  // How long the server keeps a message waiting (the event loop delay), so slowness is measured, not guessed.
+  if (req.url === "/health/loop") {
+    res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*" });
+    res.end(JSON.stringify({ p50: loopDelay.percentile(50) / 1e6, p99: loopDelay.percentile(99) / 1e6, max: loopDelay.max / 1e6, cpu: process.cpuUsage(), up: process.uptime() }));
+    loopDelay.reset();
+    return;
+  }
   if (req.url === "/health") {
     res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*" });
     res.end(JSON.stringify({ ok: true, region: process.env.REGION_NAME ?? null, chainRooms: config.rooms, cluster: config.cluster, programId: config.programId, devBots: config.devBots, rooms: hub.rooms.size, clients: hub.clients.size, matchesRunning: hub.matchesRunning(), maintenance: maintenancePublic(), revision: process.env.K_REVISION ?? null }));
@@ -74,7 +87,17 @@ const server = http.createServer((req, res) => {
   }
   if ((req.url ?? "").split("?")[0] === "/live") {
     res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*", "cache-control": "no-store" });
-    res.end(JSON.stringify({ duels: hub.liveDuels(), bots: [...botWallets(), ...(hub.live ? hub.live.botAddresses() : [])], ...(hub.live ? { arena: hub.live.stats() } : {}) }));
+    res.end(JSON.stringify({ duels: hub.liveDuels(), bots: [...botWallets(), ...[...hub.lives.values()].flatMap((l) => l.botAddresses())], ...(hub.live ? { arena: hub.live.stats(), arenas: [...hub.lives.values()].map((l) => l.summary()) } : {}) }));
+    return;
+  }
+  // Cash arena tickets: the payments of a wallet to the vault that have not bought a place yet (devnet).
+  const tk = /^\/cash\/tickets\/([1-9A-HJ-NP-Za-km-z]{32,44})$/.exec((req.url ?? "").split("?")[0]);
+  if (tk) {
+    if (limited(realIp(req), "tickets", 30, 60_000)) return void res.writeHead(429, { "access-control-allow-origin": "*" }).end();
+    void ticketsOf(tk[1], CASH_MIN_ENTRY).then(
+      (list) => { res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*", "cache-control": "no-store" }); res.end(JSON.stringify({ tickets: list })); },
+      () => { res.writeHead(502, { "access-control-allow-origin": "*" }).end(); },
+    );
     return;
   }
   if ((req.url ?? "").split("?")[0] === "/duels") {
@@ -90,6 +113,24 @@ const server = http.createServer((req, res) => {
       (body) => { res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*", "cache-control": "no-store" }); res.end(body); },
       () => { res.writeHead(502, { "access-control-allow-origin": "*" }).end(); },
     );
+    return;
+  }
+  // The VAR of the cash arena: every recorded clip, newest first, and any clip by its id. Public data, read only.
+  if ((req.url ?? "").split("?")[0] === "/var/recent") {
+    const qs = new URLSearchParams((req.url ?? "").split("?")[1] ?? "");
+    void recentClips(Number(qs.get("limit") ?? 30) || 30).then((items) => {
+      res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*", "cache-control": "no-store" });
+      res.end(JSON.stringify({ items }));
+    });
+    return;
+  }
+  const vm = /^\/var\/([0-9a-z-]{6,40})$/.exec((req.url ?? "").split("?")[0]);
+  if (vm) {
+    if (limited(realIp(req), "archive", 60, 60_000)) return void res.writeHead(429, { "access-control-allow-origin": "*" }).end();
+    void clipById(vm[1]).then((c) => {
+      res.writeHead(c ? 200 : 404, { "content-type": "application/json", "access-control-allow-origin": "*", "cache-control": c ? "public, max-age=3600" : "no-store" });
+      res.end(JSON.stringify(c ?? { error: "not_found" }));
+    });
     return;
   }
   // The global history: the newest matches of everybody, newest first, with a cursor. Public data, read only.
@@ -180,7 +221,10 @@ await startCounters();
 await startIdeas();
 startMaintenance();
 hub.start();
+// No powers in any mode on any network: only the cash out stays.
+Arena.onlyCashout = true;
 if (process.env.LIVE_ARENA === "1" && config.cluster === "devnet") hub.enableLive();
+if (config.guestRooms) hub.enableGuestRooms();
 process.on("SIGTERM", () => void Promise.all([flush(), flushIdeas()]).finally(() => process.exit(0)));
 
 // Only the newest revision may run matches. Cloud Run keeps an old instance alive while it holds sockets (up to an hour),

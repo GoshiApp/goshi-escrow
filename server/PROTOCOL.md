@@ -23,7 +23,23 @@ or a newly opened one. The client then takes the seat with `join_room` as usual.
 At any time, even before `auth`: `{ "t": "practice", "name": "Ana" }`. The server starts an instant match for that socket only: the player plus 12 bots
 (9 paid-style and 3 saboteur-style), 3 minutes, the zone starts shrinking at 60 s, same physics and same messages (`entered`, `start`, `snap`, `end`)
 with `"practice": true` on `entered`, `start` and `end`. `end.tx` is null and `end.payout.podium` is empty. `input` and `leave` apply to the practice match.
-Nothing touches the chain. Limit: 30 practice matches at once (`busy`).
+Nothing touches the chain. Limit: 30 practice matches at once (`busy`), 6 per IP. Survival matches (`mode:"survival"`, up to 6 hours) count
+against their own pool instead: 10 at once, 1 per IP, so long matches cannot crowd out practice.
+
+## Guest rooms (devnet/test only, GUEST_ROOMS=1)
+Free multiplayer rooms with a short shareable code: no wallet, no chain, no money. A room waits in a lobby until the host starts it,
+then every member plays the same minute of frenzy and the same arena as practice (bots fill the roster to 10), with the usual
+`entered`/`start`/`fsnap`/`fend`/`snap`/`end` messages carrying `"practice": true`. A room closes when the match ends, when the last
+member leaves, or after 15 minutes of lobby. Limits: 5 members per room, 20 rooms per server. New error codes: `guest_rooms_off`
+(the flag is off), `no_room` (unknown code, room in a match, or lobby timed out), `not_host`.
+- client -> `{ "t": "groom_create", "name": "Ana" }` opens a room. Answer `{ "t": "groom_created", "code": "K7Q2", "players": [ { "n", "host" } ], "max": 5 }`.
+- client -> `{ "t": "groom_join", "name": "Beto", "code": "k7q2" }` (the code is normalized: upper case, letters and digits). The joiner
+  gets the same `groom_created`; the others get `{ "t": "groom_update", "players": [ { "n", "host" } ] }`.
+- client -> `{ "t": "groom_start" }` (host only, at least one member). Unknown codes or rooms already playing answer `no_room`.
+- client -> `{ "t": "groom_leave" }` leaves; if the host leaves the next member becomes the host and everyone gets a `groom_update`.
+  When the socket closes the membership is dropped. A socket plays in one place only: joining a guest room ends a practice match
+  and starting practice leaves the guest room.
+- The room code is 4 characters of `ABCDEFGHJKMNPQRSTUVWXYZ23456789` (no I, L, O, 0 or 1).
 
 ## Rooms (on-chain account `MatchRoom`, program v2)
 A room has an entry fee in lamports, up to 10 PAID seats (the player sends the fee with `join_room`) and up to 3 SABOTEUR seats

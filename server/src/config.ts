@@ -24,6 +24,11 @@ export const config = {
   /** $GOSHI base units a wallet must hold to take a saboteur seat. The authority sets the same value on-chain. */
   minHolder: BigInt(process.env.MIN_HOLDER ?? dc.minHolder ?? "100000000"),
   devBots: process.env.DEV_BOTS === "1",
+  /** Guest rooms with short codes (GUEST_ROOMS=1): free multiplayer rooms for the test site. Devnet only. */
+  guestRooms: process.env.GUEST_ROOMS === "1",
+  /** Survival matches (up to 6 h) get their own slot pool so they cannot exhaust practice capacity. */
+  maxSurvival: Number(process.env.MAX_SURVIVAL) > 0 ? Number(process.env.MAX_SURVIVAL) : 10,
+  maxSurvivalPerIp: Number(process.env.MAX_SURVIVAL_PER_IP) > 0 ? Number(process.env.MAX_SURVIVAL_PER_IP) : 1,
   /** ROOMS=0: a server of another region that only runs practice and the live arena; the rooms with entries (on chain) are run by
    *  one server only, so two servers never act on the same room. */
   rooms: process.env.ROOMS !== "0",
@@ -71,6 +76,9 @@ if (config.cluster !== "devnet" && process.env.CONFIRM_MAINNET !== "yes-really")
 }
 if (config.devBots && config.cluster !== "devnet") {
   throw new Error("DEV_BOTS is only allowed on devnet.");
+}
+if (config.guestRooms && config.cluster !== "devnet") {
+  throw new Error("GUEST_ROOMS is only allowed on devnet.");
 }
 
 /** The authority keypair. Read from disk, kept in memory, never logged. */

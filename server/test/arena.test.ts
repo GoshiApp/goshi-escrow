@@ -231,7 +231,7 @@ test("camping in the middle is punished: a player that never moves from the cent
   assert.equal(camper.killer, "zone");
 });
 
-test("survival: a body three times heavier eats a bite of a small body instead of dying on it", () => {
+test("survival: a dominant head that hits the middle of a small body is not killed but pays mass for the knock", () => {
   const a = new Arena(3, ents(2), { matchMs: 3600_000, shrinkStartMs: 3600_000, survival: true });
   const small = place(a, "W1", 1500, 1500, 0);
   small.m = 25;
@@ -239,11 +239,28 @@ test("survival: a body three times heavier eats a bite of a small body instead o
   const big = place(a, "W0", 1450, 1506, 0);
   big.m = 90;
   big.protectUntil = 0; small.protectUntil = 0;
-  a.orbs.length = 0; // no orb to eat in the same step: only the bite changes the masses
+  a.orbs.length = 0;
   a.step(0.05);
   assert.equal(big.alive, true, "the heavy body is not killed by the small one's body");
-  assert.ok(big.m > 90, "it gained mass");
-  assert.ok(small.m < 25, "the small one lost some");
+  assert.ok(big.m < 90, "it lost mass for the knock");
+  assert.ok(small.m >= 25 - 1e-9 && small.alive, "the small one is not hurt");
+});
+
+test("survival: a body five times heavier eats the tail of a small one, mass for mass", () => {
+  const a = new Arena(3, ents(2), { matchMs: 3600_000, shrinkStartMs: 3600_000, survival: true });
+  const small = place(a, "W1", 1500, 1500, 0);
+  small.m = 25;
+  lay(small, Array.from({ length: 40 }, (_, i) => [1500 - 4 * (i + 1), 1500] as [number, number]));
+  const pts = bodyPoints(small);
+  const tail = pts[pts.length - 1];
+  const big = place(a, "W0", tail[0], tail[1] + 4, 0);
+  big.m = 200;
+  big.protectUntil = 0; small.protectUntil = 0;
+  a.orbs.length = 0;
+  const total = big.m + small.m;
+  a.step(0.05);
+  assert.ok(big.m > 200 && small.m < 25, `the tail moved to the big one (${big.m}, ${small.m}, ${big.alive}, ${small.alive})`);
+  assert.ok(Math.abs(big.m + small.m - total) < 1e-6, "nothing is lost or made up");
 });
 
 test("rules 1: the same touch kills the one that touched (a heavy body is not spared)", () => {

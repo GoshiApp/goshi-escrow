@@ -1,6 +1,5 @@
 import { EventEmitter } from "node:events";
 import crypto from "node:crypto";
-import nacl from "tweetnacl";
 import type WebSocket from "ws";
 import { config, log, ownsRoom } from "./config.js";
 import { holding } from "./ideas.js";
@@ -9,19 +8,24 @@ import { accrueRoom, setReferrer } from "./referrals.js";
 import { loadSecret, markStarted } from "./secrets.js";
 import { isNewVisitorToday, noteWallet } from "./visitors.js";
 import { payPracticePrize } from "./practicePrize.js";
+import { practiceAdmit } from "./practice-admit.js";
 import { duelTierAllowed, limits } from "./limits.js";
 import { maintenancePublic, maintenanceState, newMatchesAllowed } from "./maintenance.js";
 import { settleDuel } from "./game/settlement.js";
 import { FOUNDER_SKINS, SKIN_HOLD_USD, isFounder, isKnownSkin } from "./game/skins.js";
 import { authMessage, makeSession, newNonce, SESSION_TTL_MS, sessionSecretFrom, verifyAuth, verifySession } from "./auth.js";
-import { authority, cancelRoom, createRoom, blockhashOfSlot, fetchRoom, finalizeDuel, finalizeRoyale, buildDuelTx, finalizeVs, forgetSecret, startDuel, joinWithPass, listRooms, roomSecret, startVs, type ChainRoom } from "./chain.js";
+import { authority, cancelRoom, finalizeBags, flushTrapsIfDue, type Backpacks, createRoom, blockhashOfSlot, fetchRoom, finalizeDuel, finalizeRoyale, buildDuelTx, finalizeVs, forgetSecret, startDuel, joinWithPass, listRooms, roomSecret, startVs, type ChainRoom } from "./chain.js";
 import { Match, type FrenzyOptions, type MatchResult } from "./match.js";
-import { AWAY_PROTECT_S, isDifficulty, setBotDifficulty } from "./game/arena.js";
+import { frenzyFor } from "./frenzy-for.js";
+import { reservedName } from "./names.js";
+import { AWAY_PROTECT_S, isDifficulty, setBotDifficulty, setDefaultRules, type TrapKind } from "./game/arena.js";
 import { latestSnapshot, takeSnapshot } from "./snapshot.js";
 import { addMatch, addVisit, counts } from "./counters.js";
-import { jackpotDraw, settleRoyale, settleVs } from "./game/settlement.js";
+import { jackpotDraw, setContractV6, settleRoyale, settleVs } from "./game/settlement.js";
 import { faucet, fillWithBots, isBot } from "./devbots.js";
-import { LiveArena } from "./live.js";
+import { LIVE_TIERS, LiveArena } from "./live.js";
+import { checkLengthPayment } from "./length-pay.js";
+import { GuestRooms } from "./grooms.js";
 import { feeAllowed, feeOfTier, feeOptions, refreshPrice, solPriceUsd, tierUsdOf } from "./price.js";
 
 export interface Client {
@@ -30,9 +34,12 @@ export interface Client {
   wallet?: string;
   watching: Set<string>;
   entered?: string;
-  practice?: { match: Match; you: string };
+  /** The free match this connection plays right now (practice, survival or show). */
+  practice?: { match: Match; you: string; survival?: boolean };
   /** The live arena: the id it watches with, and the place it holds (null: only watching or waiting). */
-  live?: { spectator: string; slot: number | null; dead?: boolean; skin?: string | null };
+  live?: { arena?: string; spectator: string; slot: number | null; dead?: boolean; skin?: string | null; wallet?: string | null; entrySig?: string | null };
+  /** The guest room (GUEST_ROOMS=1) this connection belongs to, with its player id. */
+  groom?: { code: string; you: string };
   tokens: number;
   lastRefill: number;
   /** Asked for the live numbers of the landing page. */
@@ -82,36 +89,29 @@ interface Entry {
 const SESSION_SECRET = sessionSecretFrom(authority.secretKey);
 /** Hosts a sign-in text may name: the allowed web origins (and localhost for tests). */
 const AUTH_HOSTS = config.allowedOrigins.flatMap((o) => { try { return [new URL(o).host]; } catch { return []; } });
-const sha256 = (...parts: (Uint8Array | string)[]) => {
-  const h = crypto.createHash("sha256");
-  for (const p of parts) h.update(p);
-  return h.digest();
-};
 
-/**
- * Everything a room needs to be reproducible: the seed from sha256(secret, blockhash, room id), the frozen price photo and
- * the signature of that photo. The secret was committed to when the room was created and is revealed at settlement.
- */
-async function frenzyFor(roomId: string, known: Buffer | undefined, blockhash: Uint8Array) {
-  const secret = known ?? crypto.randomBytes(32);
-  const idBytes = /^\d+$/.test(roomId) ? (() => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(roomId)); return b; })() : sha256(roomId).subarray(0, 8);
-  const seedHash = sha256(secret, blockhash, idBytes);
-  const seed = (seedHash.readUInt32LE(0) & 0x7fffffff) || 1;
-  const snapshot = await takeSnapshot();
-  const commit = sha256(secret).toString("hex");
-  const sig = nacl.sign.detached(Buffer.from(`${snapshot.hash}|${commit}|${roomId}`), authority.secretKey);
-  const opts: FrenzyOptions = { snapshot, commit, signature: Buffer.from(sig).toString("hex") };
-  return { seed, secret, blockhash, opts, committed: known !== undefined };
-}
 const short = (w: string) => `${w.slice(0, 4)}..${w.slice(-4)}`;
 const send = (c: Client, msg: object) => {
   if (c.ws.readyState === 1) c.ws.send(JSON.stringify(msg));
 };
 const err = (c: Client, code: string, message: string) => send(c, { t: "error", code, message });
 
+// Mainnet keeps the v5 money rules (10 percent) until its program is upgraded and CONTRACT_V6=1 is set on its server.
+setContractV6(config.cluster !== "mainnet-beta" || process.env.CONTRACT_V6 === "1");
+// Rules 4 (nothing left to chance but where a dead body's coins land) on the test network; mainnet keeps rules 3 for now.
+setDefaultRules(config.cluster === "mainnet-beta" ? 3 : 8);
+/** The super pot draw is chance: it stays off on the test network (decision 2026-10-19: nothing left to chance). */
+const JACKPOT_DRAW = config.cluster === "mainnet-beta";
+/** The rules of a free practice match, on every network (the paid rooms of mainnet keep their own, see setDefaultRules). */
+const PRACTICE_RULES = 8;
+/** Contract v7 is deployed on the test network only: there a royale pays every player the bag they hold. */
+const BAGS = config.cluster !== "mainnet-beta";
+
 export class Hub extends EventEmitter {
   /** The always-running live arena (only on the practice servers, switched on with LIVE_ARENA=1). */
   live?: LiveArena;
+  /** Guest rooms with shareable codes (switched on with GUEST_ROOMS=1, devnet only). */
+  guests?: GuestRooms;
   readonly clients = new Set<Client>();
   readonly rooms = new Map<string, Entry>();
   private created = new Map<string, number[]>();
@@ -122,6 +122,8 @@ export class Hub extends EventEmitter {
   /** Room id -> the wallet that asked for it (rooms opened by a person, not by the duel flow). One open room per wallet, and a
    *  room whose maker never took a seat is closed after a short time, so nobody can hold the open rooms of the server. */
   private makers = new Map<string, { w: string; at: number }>();
+  /** Who created each public room: only they may start it before it is full. */
+  private hosts = new Map<string, string>();
   /** Wallet -> cosmetic skin id (validated), used when a room starts. */
   private skinOf = new Map<string, string>();
   /** Private duels waiting or running: room id -> creator and size. Persisted so a restart does not forget them. */
@@ -198,6 +200,9 @@ export class Hub extends EventEmitter {
     setInterval(() => void takeSnapshot(), 30_000);
     if (!config.rooms) return;
     this.timer = setInterval(() => void this.poll(), Number(process.env.POLL_MS ?? 4000));
+    // Test network showcase: when no room is open or playing, the bots take a real room (devnet SOL) every 20 minutes, so a
+    // visitor can always watch the real game and every match goes to the records. One region only (SHOWCASE=1).
+    if (config.devBots && config.cluster === "devnet" && process.env.SHOWCASE === "1") setInterval(() => void this.showcase(), 60_000);
     void this.poll();
   }
   stop() {
@@ -250,12 +255,28 @@ export class Hub extends EventEmitter {
 
   enableLive(): void {
     if (this.live) return;
+    // The first arena is the one the pages always knew; on the test network the other entries run next to it.
     this.live = new LiveArena((c, m) => send(c, m));
+    this.lives.set(this.live.tier.id, this.live);
+    if (config.cluster === "devnet") for (const t of LIVE_TIERS.slice(1)) this.lives.set(t.id, new LiveArena((c, m) => send(c, m), t));
+  }
+  /** Every live arena by id (one per entry on the test network). */
+  readonly lives = new Map<string, LiveArena>();
+  /** The arena a connection is in (or asks for), the first one by default. */
+  liveOf(c: Client, id?: unknown): LiveArena | undefined {
+    const want = typeof id === "string" ? this.lives.get(id) : undefined;
+    return want ?? (c.live?.arena ? this.lives.get(c.live.arena) : undefined) ?? this.live;
+  }
+
+  enableGuestRooms(): void {
+    if (this.guests) return;
+    this.guests = new GuestRooms((c, m) => send(c, m));
   }
 
   disconnect(c: Client) {
     this.clients.delete(c);
-    this.live?.drop(c);
+    for (const l of this.lives.values()) l.drop(c);
+    this.guests?.drop(c);
     c.practice?.match.stop();
     c.practice = undefined;
     const was = c.entered;
@@ -307,22 +328,79 @@ export class Hub extends EventEmitter {
     if (msg.t === "live_watch" || msg.t === "live_join" || msg.t === "live_leave") {
       if (!this.live) return err(c, "no_live", "There is no live arena on this server.");
       if (maintenanceState() === "down") return err(c, "maintenance", "Scheduled maintenance: the arena is closed until it ends.");
+      // Moving to another arena: whatever was held in the old one is freed first.
+      const target = this.liveOf(c, msg.arena)!;
+      const cur = c.live ? c.live.arena ?? this.live.tier.id : null;
+      if (msg.t !== "live_leave" && cur && cur !== target.tier.id) { this.lives.get(cur)?.drop(c); c.live = undefined; }
       if (msg.t === "live_watch") {
-        if (!this.live.watch(c)) return err(c, "busy", "The live arena is full of spectators, try again in a minute.");
+        if (!target.watch(c)) return err(c, "busy", "The live arena is full of spectators, try again in a minute.");
+        if (c.live) c.live.arena = target.tier.id;
         return;
       }
-      if (msg.t === "live_leave") return this.live.leave(c);
+      if (msg.t === "live_leave") return target.leave(c);
       const name = typeof msg.name === "string" ? msg.name.replace(/[^\p{L}\p{N} _-]/gu, "").slice(0, 14).trim() : "";
       const wallet = typeof msg.wallet === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(msg.wallet) ? msg.wallet : null;
       const skin = typeof msg.skin === "string" ? msg.skin.slice(0, 24) : null;
-      return this.live.join(c, name, wallet, skin);
+      // The cash arena (devnet): the signature of the entry this wallet paid to the vault, checked on chain before it counts.
+      const entrySig = typeof msg.entrySig === "string" && /^[1-9A-HJ-NP-Za-km-z]{64,90}$/.test(msg.entrySig) ? msg.entrySig : null;
+      target.join(c, name, wallet, skin, entrySig);
+      if (c.live) c.live.arena = target.tier.id;
+      return;
     }
     if (msg.t === "afk") {
-      if (c.live) this.live?.afk(c, msg.on === true);
+      if (c.live) this.liveOf(c)?.afk(c, msg.on === true);
+      return;
+    }
+    // Bought length in the live arena: the payment goes straight to the house wallets and is checked on chain first.
+    if (msg.t === "buyLength") {
+      if (!c.live || !this.liveOf(c)) return send(c, { t: "lengthNo", reason: "not_playing" });
+      const sig = typeof msg.sig === "string" ? msg.sig : "";
+      void checkLengthPayment(sig).then((res) => {
+        if (res.r !== "ok") return send(c, { t: "lengthNo", reason: res.r });
+        const got = this.liveOf(c)?.growLength(c, res.payer) ?? "credit";
+        log("length_bought", { sig: sig.slice(0, 16), got });
+        send(c, got === "credit" ? { t: "lengthNo", reason: "credit" } : { t: "lengthOk", bonus: got });
+      });
+      return;
+    }
+    // Traps (rules 3): free in practice, the live arena and guest rooms (with a short wait); paid from the backpack in a room.
+    if (msg.t === "trap") {
+      const kind = [1, 2, 3, 4, 5].includes(msg.kind) ? (msg.kind as TrapKind) : null;
+      if (!kind) return;
+      const r = c.live ? this.liveOf(c)?.trap(c, kind)
+        : c.groom ? this.guests?.trap(c, kind)
+        : c.practice ? c.practice.match.trap(c.practice.you, kind, true)
+        : c.entered && c.wallet ? this.rooms.get(c.entered)?.match?.trap(c.wallet, kind, false)
+        : null;
+      if (r) send(c, r.ok ? { t: "trapOk", kind, left: r.left } : { t: "trapNo", kind, reason: r.reason });
       return;
     }
     if (msg.t === "input" && c.live) {
-      this.live?.input(c, Number(msg.dx), Number(msg.dy), !!msg.boost);
+      this.liveOf(c)?.input(c, Number(msg.dx), Number(msg.dy), !!msg.boost);
+      return;
+    }
+    // Guest rooms: free rooms with a short code, no wallet and no chain (GUEST_ROOMS=1, devnet only).
+    if (msg.t === "groom_create" || msg.t === "groom_join" || msg.t === "groom_start" || msg.t === "groom_leave") {
+      if (!this.guests) return err(c, "guest_rooms_off", "Guest rooms are not enabled on this server.");
+      if (maintenanceState() === "down") return err(c, "maintenance", "Scheduled maintenance: guest rooms are closed until it ends.");
+      // A socket plays in one place only: opening or entering a guest room ends a practice match.
+      if ((msg.t === "groom_create" || msg.t === "groom_join") && c.practice) {
+        c.practice.match.stop();
+        c.practice = undefined;
+      }
+      const name = typeof msg.name === "string" ? msg.name.replace(/[^\p{L}\p{N} _-]/gu, "").slice(0, 14).trim() : "";
+      const code = typeof msg.code === "string" ? msg.code.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6) : "";
+      if (msg.t === "groom_create") return void this.guests.create(c, name);
+      if (msg.t === "groom_join") return void this.guests.join(c, name, code);
+      if (msg.t === "groom_start") return void this.guests.start(c);
+      return void this.guests.leave(c);
+    }
+    if (msg.t === "input" && c.groom) {
+      this.guests?.input(c, Number(msg.dx), Number(msg.dy), !!msg.boost);
+      return;
+    }
+    if (msg.t === "leave" && c.groom) {
+      this.guests?.leave(c);
       return;
     }
     if (msg.t === "practice") return this.onPractice(c, msg);
@@ -395,6 +473,10 @@ export class Hub extends EventEmitter {
         }
         case "createDuel":
           return void (await this.onCreateDuel(c, msg));
+        case "startNow": {
+          const id = roomIdOf(msg.roomId);
+          return void (id ? await this.onStartNow(c, id) : err(c, "bad_room", "That room id is not valid."));
+        }
         case "startDuel": {
           const id = roomIdOf(msg.roomId);
           return void (id ? await this.onStartDuel(c, id) : err(c, "bad_room", "That room id is not valid."));
@@ -420,18 +502,33 @@ export class Hub extends EventEmitter {
 
   /** A free match against bots, started on demand. No chain, no money, no wallet. */
   private async onPractice(c: Client, msg: any) {
+    if (c.groom) this.guests?.leave(c); // a socket plays in one place only
     if (c.practice) {
       c.practice.match.stop();
       c.practice = undefined;
     }
     if (maintenanceState() === "down") return err(c, "maintenance", "Scheduled maintenance: practice is closed until it ends.");
-    const live = [...this.clients].filter((x) => x.practice);
-    if (live.length >= config.maxPractice) return err(c, "busy", "Practice is full right now, try again in a minute.");
-    // One address cannot fill every practice slot and shut everybody else out.
-    if (c.ip && live.filter((x) => x.ip === c.ip).length >= MAX_PRACTICE_PER_IP) return err(c, "busy", "Too many practice matches from your connection, finish one first.");
     // "show": an arena of 20 elite bots with nobody playing, for a live stream; the viewer only watches.
     const show = msg.mode === "show";
     const survival = msg.mode === "survival" || show;
+    // Practice and survival count against separate pools, so the 6 hour survival matches cannot
+    // crowd out the quick practice ones (and the per-IP caps are separate too).
+    const running = [...this.clients].filter((x) => x.practice);
+    const counts = {
+      normal: running.filter((x) => x.practice && !x.practice.survival).length,
+      survival: running.filter((x) => x.practice?.survival).length,
+      perIp: c.ip ? running.filter((x) => x.ip === c.ip && x.practice && (!!x.practice.survival === survival)).length : 0,
+    };
+    const verdict = practiceAdmit(survival ? "survival" : "normal", counts, {
+      maxPractice: config.maxPractice, maxPerIp: MAX_PRACTICE_PER_IP,
+      maxSurvival: config.maxSurvival, maxSurvivalPerIp: config.maxSurvivalPerIp,
+    });
+    if (verdict === "busy") {
+      const poolFull = survival ? counts.survival >= config.maxSurvival : counts.normal >= config.maxPractice;
+      return err(c, "busy", poolFull
+        ? "Practice is full right now, try again in a minute."
+        : "Too many practice matches from your connection, finish one first.");
+    }
     const you = `you_${crypto.randomBytes(6).toString("hex")}`;
     const prizeWallet = typeof msg.wallet === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(msg.wallet) ? msg.wallet : null;
     let raw = typeof msg.name === "string" ? msg.name.replace(/[^\p{L}\p{N} _-]/gu, "").slice(0, 14).trim() : "";
@@ -480,13 +577,17 @@ export class Hub extends EventEmitter {
       fz.opts,
       survival,
       show ? 5 : 0,
+      // Free practice runs the newest rules everywhere (the boss, the powers, coins that fuse); no money depends on them.
+      PRACTICE_RULES,
     );
     if (show) setBotDifficulty(match.arena, "insane");
     else if (isDifficulty(msg.difficulty)) setBotDifficulty(match.arena, msg.difficulty);
     if (isDifficulty(msg.difficulty) && !survival) match.setFrenzyLevel(msg.difficulty);
-    c.practice = { match, you };
+    c.practice = { match, you, survival };
     send(c, { t: "entered", roomId: id, role: "paid", practice: true });
     send(c, { ...match.startMsg(you), practice: true });
+    // Survival coins are worth what they are worth on the market: the prices of the moment the arena starts.
+    if (survival) match.arena.coinPrices = { ...(await takeSnapshot()).usd };
     match.begin();
     log("practice_started", { id });
   }
@@ -495,9 +596,12 @@ export class Hub extends EventEmitter {
   private async onSkin(c: Client, msg: any) {
     if (!c.wallet) return;
     const id = msg.id;
+    // A plain goshi color is open to everybody.
+    if (typeof id === "string" && /^hue:[0-7]$/.test(id)) return void this.skinOf.set(c.wallet, id);
     if (!isKnownSkin(id)) return void this.skinOf.delete(c.wallet);
     if (FOUNDER_SKINS.includes(id) && !isFounder(c.wallet)) return void this.skinOf.delete(c.wallet);
-    const need = SKIN_HOLD_USD[id];
+    // The test network opens the holder skins too, so they can be tried; on mainnet they need the balance.
+    const need = config.cluster === "devnet" ? undefined : SKIN_HOLD_USD[id];
     if (need !== undefined) {
       try {
         const h = await holding(c.wallet);
@@ -533,6 +637,7 @@ export class Hub extends EventEmitter {
     this.created.set(c.wallet!, mine);
     const { roomId, tx } = await createRoom(fee);
     this.makers.set(roomId, { w: c.wallet!, at: Date.now() });
+    this.hosts.set(roomId, c.wallet!);
     send(c, { t: "roomCreated", roomId, tx });
     void this.poll();
   }
@@ -576,6 +681,18 @@ export class Hub extends EventEmitter {
     this.duelMeta.set(roomId, { creator: me, max: guests.length + 1, at: Date.now() });
     void persistDuel(roomId, me, guests.length + 1);
     send(c, { t: "duelTx", roomId, tx, players: guests.length + 1, guests });
+  }
+
+  /** The creator of a public room starts it before it is full: every seated player is asked at once to play it as VS (the
+   *  same offer the server makes after the wait), and it starts only if they all accept. Nothing moves without that. */
+  private async onStartNow(c: Client, roomId: string) {
+    const e = await this.entryFor(roomId, c);
+    if (!e || e.chain.mode !== "royale") return err(c, "no_room", "That room does not exist.");
+    if (this.hosts.get(roomId) !== c.wallet) return err(c, "not_creator", "Only who made the room can start it early.");
+    if (e.chain.state !== "waiting" || e.chain.paid.length < 2) return err(c, "not_ready", "The room needs at least two players.");
+    if (e.offer) return;
+    e.firstSeen = 0;
+    await this.vsFallback(e);
   }
 
   private async onStartDuel(c: Client, roomId: string) {
@@ -625,6 +742,24 @@ export class Hub extends EventEmitter {
     this.makers.set(roomId, { w: me, at: Date.now() });
     void this.poll();
     send(c, { t: "quickRoom", roomId, created: true, paid: 0, tx });
+  }
+
+  private showcaseAt = 0;
+  private async showcase() {
+    if (Date.now() - this.showcaseAt < 20 * 60_000 || config.paused || !newMatchesAllowed()) return;
+    const busy = [...this.rooms.values()].some((e) => e.chain.mode === "royale" && !this.duelMeta.has(e.chain.id) && (e.chain.state === "waiting" || !!e.match));
+    if (busy) return;
+    const fee = feeOptions()[0]?.lamports;
+    if (!fee) return;
+    this.showcaseAt = Date.now();
+    try {
+      const { roomId } = await createRoom(fee);
+      log("showcase_room", { roomId, fee: fee.toString() });
+      await fillWithBots(roomId, config.paidSlots, config.freeSlots);
+      void this.poll();
+    } catch (e: any) {
+      log("showcase_failed", { error: String(e?.message ?? e).slice(0, 160) });
+    }
   }
 
   private async onFill(c: Client, msg: any) {
@@ -859,7 +994,7 @@ export class Hub extends EventEmitter {
       for (const [id, m] of [...this.duelMeta]) if (!seen.has(id) && m.at && Date.now() - m.at > 600_000) this.duelMeta.delete(id);
       for (const id of [...this.rooms.keys()]) {
         const e = this.rooms.get(id)!;
-        if (!seen.has(id) && !(e.match && !e.match.ended)) this.rooms.delete(id);
+        if (!seen.has(id) && !(e.match && !e.match.ended)) { this.rooms.delete(id); this.hosts.delete(id); }
       }
     } catch (e: any) {
       log("poll_failed", { error: String(e?.message ?? e) });
@@ -965,6 +1100,12 @@ export class Hub extends EventEmitter {
       fz.opts,
     );
     e.match = match;
+    match.setBackpacks(e.chain.paid, e.chain.backpacks, e.chain.entryFee);
+    // Contract v7 (the test network): a royale is paid by bag. The pot the players share becomes coins on the map.
+    if (BAGS && e.chain.mode === "royale") {
+      const cash = e.chain.entryFee * BigInt(e.chain.paid.length - e.chain.passes);
+      match.setBags(cash - (cash * 3n) / 100n);
+    }
     e.starting = false;
     for (const c of e.watchers) send(c, match.startMsg(c.wallet!));
     match.begin();
@@ -978,7 +1119,24 @@ export class Hub extends EventEmitter {
     const entry = chain.entryFee;
     let payout: any;
     let jackpotWinner: string | null = null;
-    if (res.mode === "royale") {
+    if (res.mode === "royale" && e.match?.bagPool) {
+      // Contract v7: every paid seat is paid its bag; what nobody holds is split among the best three (see Match.bagsFor).
+      const nominal = entry * BigInt(chain.paid.length);
+      const cash = entry * BigInt(chain.paid.length - chain.passes);
+      const bags = e.match.bagsFor(chain.paid);
+      const rank = new Map(res.ranking.map((r) => [r.w, r.rank]));
+      payout = {
+        pot: nominal.toString(),
+        cash: cash.toString(),
+        rake: (cash - bags.reduce((a, b) => a + b, 0n)).toString(),
+        bags: true,
+        podium: chain.paid.map((w, i) => ({ w, rank: rank.get(w) ?? 0, kind: "sol", lamports: bags[i].toString() }))
+          .filter((p) => p.lamports !== "0").sort((a, b) => a.rank - b.rank),
+        saboteurs: [],
+        unclaimed: "0",
+        jackpot: { triggered: false, amount: "0", winner: null as string | null },
+      };
+    } else if (res.mode === "royale") {
       // Saboteurs do not compete: the podium is the best three PAID players.
       const top = res.ranking.filter((r) => r.role === "paid").slice(0, 3);
       const nominal = entry * BigInt(chain.paid.length);
@@ -996,7 +1154,7 @@ export class Hub extends EventEmitter {
       };
       // Jackpot event: 1 in `jackpotOneIn` after a full royale of 10 paid players, drawn from the committed secret and the
       // blockhash of the block where the room filled, so it can be recomputed from the proof (see jackpotDraw).
-      if (chain.paid.length === config.paidSlots && e.seedParts && jackpotDraw(e.seedParts.secret, e.seedParts.blockhash, chain.id, config.jackpotOneIn)) {
+      if (JACKPOT_DRAW && chain.paid.length === config.paidSlots && e.seedParts && jackpotDraw(e.seedParts.secret, e.seedParts.blockhash, chain.id, config.jackpotOneIn)) {
         jackpotWinner = top[0]?.w ?? null;
         log("jackpot_event", { roomId: chain.id, winner: jackpotWinner });
       }
@@ -1031,6 +1189,12 @@ export class Hub extends EventEmitter {
     return e.match.proof(e.seedParts.secret, e.seedParts.blockhash);
   }
 
+  /** v6: what each paid seat spent on traps, when the room has backpacks (settled in the closing transaction). */
+  private backpacksOf(e: Entry): Backpacks | undefined {
+    if (!e.chain.backpacks?.some((b) => b > 0n)) return undefined;
+    return { paid: e.chain.paid, spent: e.match ? e.match.spentFor(e.chain.paid) : e.chain.paid.map(() => 0n) };
+  }
+
   private async trySettle(e: Entry) {
     const p = e.pending;
     if (!p) return;
@@ -1040,17 +1204,20 @@ export class Hub extends EventEmitter {
     for (let i = 0; i < 3 && !tx; i++) {
       p.attempts++;
       try {
-        if (p.mode === "royale") {
+        if (p.mode === "royale" && p.payout.bags && e.match) {
+          tx = await finalizeBags(roomId, e.chain.paid, e.match.bagsFor(e.chain.paid), this.proofOf(e), this.backpacksOf(e));
+        } else if (p.mode === "royale") {
           tx = await finalizeRoyale(
             roomId,
             p.result.ranking.filter((r) => r.role === "paid").slice(0, 3).map((r) => r.w),
             e.chain.free,
             this.proofOf(e),
+            this.backpacksOf(e),
           );
         } else if (p.mode === "duel") {
-          tx = await finalizeDuel(roomId, p.result.ranking[0].w, this.proofOf(e));
+          tx = await finalizeDuel(roomId, p.result.ranking[0].w, this.proofOf(e), this.backpacksOf(e));
         } else {
-          tx = await finalizeVs(roomId, p.result.ranking.map((r) => r.w), this.proofOf(e));
+          tx = await finalizeVs(roomId, p.result.ranking.map((r) => r.w), this.proofOf(e), this.backpacksOf(e));
         }
       } catch (ex: any) {
         error = String(ex?.message ?? ex).slice(0, 200);
@@ -1058,6 +1225,7 @@ export class Hub extends EventEmitter {
         await new Promise((r) => setTimeout(r, 2000));
       }
     }
+    if (tx) void flushTrapsIfDue();
     if (tx && p.jackpotWinner) {
       // Manual mode: the super pot is paid by hand from the vault (withdraw_vault), so the event is only recorded here.
       log("jackpot_event_manual", { roomId, winner: p.jackpotWinner });
@@ -1099,7 +1267,7 @@ export class Hub extends EventEmitter {
           roomId, at: Date.now(), mode: p.mode, cluster: config.cluster, tx, entryFee: e.chain.entryFee.toString(),
           wallets: [...e.chain.paid, ...e.chain.free].filter((w) => !isBot(w)),
           hashes: [...(msg.proof?.replays ?? []).map((r: { hash: string }) => r.hash), ...(msg.proof ? [msg.proof.commit, msg.proof.snapshot.hash] : [])],
-          ranking: p.result.ranking, payout: p.payout, proof: msg.proof,
+          ranking: p.result.ranking, payout: p.payout, proof: msg.proof, skins: e.match.skinsMap(),
         }, rep);
         addMatch(e.chain.entryFee * BigInt(e.chain.paid.length - e.chain.passes));
       }
@@ -1237,13 +1405,6 @@ import { firestoreBase as fsBase, firestoreReady as fsReady, firestoreToken as f
 
 /** The one wallet allowed to use the project's name. Public address. */
 const CEO_WALLET = "2kLcGpwnpz5eroGRW2kWqCdizmPEGDLTb5JAce9u2GJ9";
-/** True when a name reads as the project's own: goshi with common look-alikes (0 for o, 1 or l or ! for i, $ for s, spaces). */
-export function reservedName(name: string): boolean {
-  const flat = name.toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
-    .replace(/[0]/g, "o").replace(/[1l!|]/g, "i").replace(/[$5]/g, "s").replace(/[^a-z]/g, "");
-  return flat.includes("goshi");
-}
-
 async function persistDuel(roomId: string, creator: string, max: number): Promise<void> {
   if (!fsReady()) return;
   try {

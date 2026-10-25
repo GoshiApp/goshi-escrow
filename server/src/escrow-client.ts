@@ -9,7 +9,12 @@ export const MAX_PAID = 10;
 export const MAX_FREE = 3;
 export const CONFIG_LEN = 172;
 export const LEGACY_CONFIG_LEN = 140;
-export const ROOM_LEN = 487;
+/** v6 rooms carry a backpack per paid seat; rooms made before v6 are 487 bytes. */
+export const ROOM_LEN = 567;
+export const LEGACY_ROOM_LEN = 487;
+export const TRAPS_LEN = 18;
+/** The trap pots are paid out once each holds at least this (lamports). */
+export const TRAP_FLUSH_MIN = 50_000_000n;
 export const VAULT_LEN = 18;
 
 const u64 = (n: bigint | number) => {
@@ -31,6 +36,7 @@ export function pdas(programId: PublicKey) {
   return {
     config: PublicKey.findProgramAddressSync([new TextEncoder().encode("config")], programId)[0],
     vault: PublicKey.findProgramAddressSync([new TextEncoder().encode("vault")], programId)[0],
+    traps: PublicKey.findProgramAddressSync([new TextEncoder().encode("traps")], programId)[0],
     room: (id: bigint | number) =>
       PublicKey.findProgramAddressSync([new TextEncoder().encode("room"), u64(id)], programId)[0],
   };
@@ -104,7 +110,8 @@ export class GoshiEscrow {
     );
   }
 
-  joinRoom(player: PublicKey, roomId: bigint | number) {
+  /** `backpack`: v6, lamports kept for traps (at most the entry fee), refunded in full when not spent. */
+  joinRoom(player: PublicKey, roomId: bigint | number, backpack: bigint = 0n) {
     return ix(
       this.programId,
       [
@@ -113,7 +120,7 @@ export class GoshiEscrow {
         { pubkey: this.pda.room(roomId), isWritable: true },
         { pubkey: SystemProgram.programId },
       ],
-      cat(Uint8Array.of(4), u64(roomId))
+      cat(Uint8Array.of(4), u64(roomId), ...(backpack > 0n ? [u64(backpack)] : []))
     );
   }
 
@@ -271,6 +278,23 @@ export class GoshiEscrow {
     );
   }
 
+  /** v7: a royale paid by bag. `bags` is what every paid seat receives, in seat order (the order of the room's paid list). */
+  finalizeBags(authority: PublicKey, roomId: bigint | number, infra: PublicKey, liquidity: PublicKey, paid: PublicKey[], bags: bigint[], proof?: Proof) {
+    return ix(
+      this.programId,
+      [
+        { pubkey: authority, isSigner: true, isWritable: true },
+        { pubkey: this.pda.config },
+        { pubkey: this.pda.room(roomId), isWritable: true },
+        { pubkey: this.pda.vault, isWritable: true },
+        { pubkey: infra, isWritable: true },
+        { pubkey: liquidity, isWritable: true },
+        ...paid.map((pubkey) => ({ pubkey, isWritable: true })),
+      ],
+      cat(Uint8Array.of(22), ...bags.map((b) => u64(b)), ...proofBytes(proof))
+    );
+  }
+
   finalizeVs(authority: PublicKey, roomId: bigint | number, infra: PublicKey, liquidity: PublicKey, ranking: PublicKey[], proof?: Proof) {
     return ix(
       this.programId,
@@ -298,6 +322,38 @@ export class GoshiEscrow {
         ...refunds.map((pubkey) => ({ pubkey, isWritable: true })),
       ],
       Uint8Array.of(10)
+    );
+  }
+
+  /** v6: every backpack pays what was spent on traps (seat order) and gets the rest back. Run before settling the room. */
+  settleBackpacks(authority: PublicKey, roomId: bigint | number, paid: PublicKey[], spent: bigint[]) {
+    if (paid.length !== spent.length) throw new Error("one spent amount per paid seat");
+    return ix(
+      this.programId,
+      [
+        { pubkey: authority, isSigner: true, isWritable: true },
+        { pubkey: this.pda.config },
+        { pubkey: this.pda.room(roomId), isWritable: true },
+        { pubkey: this.pda.traps, isWritable: true },
+        { pubkey: SystemProgram.programId },
+        ...paid.map((pubkey) => ({ pubkey, isWritable: true })),
+      ],
+      cat(Uint8Array.of(20), ...spent.map((x) => u64(x)))
+    );
+  }
+
+  /** v6: pays the trap pots (maintenance to infra, project to liquidity) once each holds TRAP_FLUSH_MIN. Authority or guardian. */
+  flushTraps(signer: PublicKey, infra: PublicKey, liquidity: PublicKey) {
+    return ix(
+      this.programId,
+      [
+        { pubkey: signer, isSigner: true },
+        { pubkey: this.pda.config },
+        { pubkey: this.pda.traps, isWritable: true },
+        { pubkey: infra, isWritable: true },
+        { pubkey: liquidity, isWritable: true },
+      ],
+      Uint8Array.of(21)
     );
   }
 
@@ -358,9 +414,11 @@ export interface RoomAccount {
   createdAt: bigint;
   /** The slot in which the room became active: the seed of the match uses the blockhash of that block. 0n while waiting. */
   activeSlot: bigint;
+  /** v6: the backpack of each paid seat, in seat order (all 0 in a room made before v6). */
+  backpacks: bigint[];
 }
 export function decodeRoom(d: Uint8Array): RoomAccount | null {
-  if (d.length !== ROOM_LEN || d[0] !== 2) return null;
+  if ((d.length !== ROOM_LEN && d.length !== LEGACY_ROOM_LEN) || d[0] !== 2) return null;
   const pn = d[19];
   const fn = d[20];
   const paid: PublicKey[] = [];
@@ -381,6 +439,7 @@ export function decodeRoom(d: Uint8Array): RoomAccount | null {
       : [],
     createdAt: rdU64(d, 471),
     activeSlot: rdU64(d, 479),
+    backpacks: paid.map((_, i) => (d.length >= ROOM_LEN ? rdU64(d, 487 + 8 * i) : 0n)),
   };
 }
 
@@ -393,10 +452,20 @@ export function decodeVault(d: Uint8Array): VaultAccount | null {
   return { openBurn: rdU64(d, 1), openJackpot: rdU64(d, 9) };
 }
 
+export interface TrapsAccount {
+  maintenance: bigint;
+  project: bigint;
+}
+export function decodeTraps(d: Uint8Array): TrapsAccount | null {
+  if (d.length !== TRAPS_LEN || d[0] !== 4) return null;
+  return { maintenance: rdU64(d, 1), project: rdU64(d, 9) };
+}
+
 /** Error codes of the program (custom program error numbers). */
 export const ERRORS: Record<number, string> = {
   6000: "Unauthorized", 6001: "InvalidEntryFee", 6002: "RoomMismatch", 6003: "RoomNotWaiting", 6004: "RoomNotActive",
   6005: "RoomFull", 6006: "AlreadyJoined", 6007: "NotEnoughGoshi", 6008: "BadPlayerCount", 6009: "DuplicateWinners",
   6010: "WinnerNotInRoom", 6011: "WrongAccount", 6012: "BadAccounts", 6013: "MathOverflow", 6014: "NothingPending",
   6015: "BadAccountData", 6016: "AlreadyInitialized", 6017: "BadInstruction", 6018: "TooEarly",
+  6019: "BackpackOpen", 6020: "BadBackpack", 6021: "BagsTooBig",
 };

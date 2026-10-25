@@ -12,7 +12,18 @@ import { createHash } from "node:crypto";
 // treasury, 50% rollover jackpot ($GOSHI).
 // Unclaimed pool (SOL that no paid player takes): swapped to $GOSHI, 1% burned and 99% to the jackpot.
 
-export const RAKE_PCT = 10n;
+/**
+ * The money rules follow the program that is deployed: v6 (3 percent house fee, prizes from the cash) on the test network,
+ * v5 (10 percent, prizes from the nominal pot) on mainnet until its program is upgraded. Set once at start (rooms.ts).
+ */
+let v6 = true;
+export const setContractV6 = (on: boolean): void => {
+  v6 = on;
+  RAKE_PCT = on ? 3n : 10n;
+  PRIZE_POOL_PCT = on ? 95n : 88n;
+};
+export const contractV6 = (): boolean => v6;
+export let RAKE_PCT = 3n;
 export const PRIZE_SPLIT_PCT = [60n, 25n, 15n] as const; // of the prize pool
 export const RAKE_SPLIT_PCT = { buybackBurn: 10n, infra: 15n, liquidity: 25n } as const; // jackpot = remainder
 export const FREE_CAP_PER_MILLE = 2n; // 0.2% of the whole pot, in thousandths
@@ -53,21 +64,22 @@ export interface RoyaleSettlement {
   rakeParts: { buybackBurn: bigint; infra: bigint; liquidity: bigint; jackpot: bigint };
 }
 
-export const PRIZE_POOL_PCT = 88n;
+export let PRIZE_POOL_PCT = 95n;
 export const SABOTEUR_POOL_PCT = 2n;
 
 /**
  * Royale room with saboteurs. `nominal` is the entry fee times the paid seats (a pass seat counts), `cash` is what the
- * room really holds. Prizes: 88 percent of the nominal pot, 60/25/15 (third is the remainder). Saboteurs: 2 percent split
+ * room really holds. Prizes (v6): 95 percent of the cash, 60/25/15 (third is the remainder). Saboteurs: 2 percent split
  * equally among the seated ones (dust and an unused pool go to the house). The house keeps the rest of the cash.
  * Mirrors programs/goshi-escrow/src/lib.rs `settle_royale`. Returns null when the cash cannot cover the obligations.
  */
 export function settleRoyale(nominal: bigint, cash: bigint, saboteurs: number): RoyaleSettlement | null {
-  const prizePool = pct(nominal, PRIZE_POOL_PCT);
+  const base = v6 ? cash : nominal;
+  const prizePool = pct(base, PRIZE_POOL_PCT);
   const first = pct(prizePool, PRIZE_SPLIT_PCT[0]);
   const second = pct(prizePool, PRIZE_SPLIT_PCT[1]);
   const third = prizePool - first - second;
-  const sabPool = pct(nominal, SABOTEUR_POOL_PCT);
+  const sabPool = pct(base, SABOTEUR_POOL_PCT);
   const n = BigInt(saboteurs);
   const saboteurEach = n === 0n ? 0n : sabPool / n;
   const saboteurTotal = saboteurEach * n;

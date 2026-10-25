@@ -7,7 +7,7 @@ import path from "node:path";
 import os from "node:os";
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction, type TransactionInstruction } from "@solana/web3.js";
 import { createAccount, createMint, mintTo } from "@solana/spl-token";
-import { GoshiEscrow, decodeConfig, decodeRoom, decodeVault, ERRORS } from "../client/index.ts";
+import { GoshiEscrow, decodeConfig, decodeRoom, decodeTraps, decodeVault, ERRORS, TRAP_FLUSH_MIN } from "../client/index.ts";
 
 const SOL = BigInt(LAMPORTS_PER_SOL);
 const pct = (a: bigint, p: bigint) => (a * p) / 100n;
@@ -133,7 +133,7 @@ describe("goshi-escrow native", () => {
     await expectCode(run([g.createRoom(outsider.publicKey, 999, SOL)], [outsider]), "Unauthorized");
   });
 
-  test("a full room: waits for the saboteurs, then pays 88/2/10 exactly and closes", async () => {
+  test("a full room: waits for the saboteurs, then pays 95/2/3 exactly and closes", async () => {
     const fee = SOL;
     const id = await newRoom(fee);
     for (let i = 0; i < 10; i++) await run([g.joinRoom(paid[i].publicKey, id)], [paid[i]]);
@@ -165,7 +165,7 @@ describe("goshi-escrow native", () => {
     await run([g.finalizeRoyale(authority.publicKey, id, infra.publicKey, liquidity.publicKey, podium, sab)], [authority]);
 
     const nominal = 10n * fee;
-    const pool = pct(nominal, 88n);
+    const pool = pct(nominal, 95n);
     const first = pct(pool, 60n);
     const second = pct(pool, 25n);
     const third = pool - first - second;
@@ -186,6 +186,32 @@ describe("goshi-escrow native", () => {
     assert.equal(await getRoom(id), null, "room closed");
     const v = decodeVault((await conn.getAccountInfo(g.pda.vault))!.data)!;
     assert.equal(v.openBurn + v.openJackpot, burn + jackpot);
+  });
+
+  test("v7 bags: every paid seat gets its bag, the house 3 percent, the unpaid rest to the jackpot", async () => {
+    const fee = SOL;
+    const id = await newRoom(fee);
+    for (let i = 0; i < 10; i++) await run([g.joinRoom(paid[i].publicKey, id)], [paid[i]]);
+    for (let i = 0; i < 3; i++) await run([g.joinFree(free[i].publicKey, id, freeTokens[i])], [free[i]]);
+    const seats = paid.map((k) => k.publicKey);
+    const cash = 10n * fee;
+    const pool = cash - pct(cash, 3n);
+    const tooBig = seats.map(() => pool / 10n + 1n);
+    await expectCode(run([g.finalizeBags(authority.publicKey, id, infra.publicKey, liquidity.publicKey, seats, tooBig)], [authority]), "BagsTooBig");
+    await expectCode(run([g.finalizeBags(outsider.publicKey, id, infra.publicKey, liquidity.publicKey, seats, seats.map(() => 0n))], [outsider]), "Unauthorized");
+    const swapped = [...seats]; [swapped[0], swapped[1]] = [swapped[1], swapped[0]];
+    await expectCode(run([g.finalizeBags(authority.publicKey, id, infra.publicKey, liquidity.publicKey, swapped, seats.map(() => 0n))], [authority]), "WrongAccount");
+    const bags = seats.map((_, i) => (i < 3 ? pool / 4n : 0n));
+    const left = pool - (pool / 4n) * 3n;
+    const before = { p: await Promise.all(seats.map(bal)), infra: await bal(infra.publicKey), liq: await bal(liquidity.publicKey), vault: await bal(g.pda.vault) };
+    await run([g.finalizeBags(authority.publicKey, id, infra.publicKey, liquidity.publicKey, seats, bags)], [authority]);
+    for (let i = 0; i < 10; i++) assert.equal((await bal(seats[i])) - before.p[i], bags[i]);
+    const rake = cash - pool;
+    const burn = pct(rake, 10n), inf = pct(rake, 15n), liq = pct(rake, 25n);
+    assert.equal((await bal(infra.publicKey)) - before.infra, inf);
+    assert.equal((await bal(liquidity.publicKey)) - before.liq, liq);
+    assert.equal((await bal(g.pda.vault)) - before.vault, rake - inf - liq + left);
+    assert.equal(await getRoom(id), null, "room closed");
   });
 
   test("proof logs: the commit at create_room and the proof at finalize, with no extra account", async () => {
@@ -231,11 +257,11 @@ describe("goshi-escrow native", () => {
     assert.equal(r.passes, 1);
     assert.equal(r.state, "active");
     const held = await bal(room(id));
-    const rent = BigInt(await conn.getMinimumBalanceForRentExemption(487));
+    const rent = BigInt(await conn.getMinimumBalanceForRentExemption(567));
     assert.equal(held - rent, 9n * fee, "only nine entries are inside");
 
     const podium = [passHolder.publicKey, paid[2].publicKey, paid[5].publicKey];
-    const first = pct(pct(10n * fee, 88n), 60n);
+    const first = pct(pct(9n * fee, 95n), 60n); // v6: the prizes come from the nine entries the room holds
     const b = await bal(passHolder.publicKey);
     await run([g.finalizeRoyale(authority.publicKey, id, infra.publicKey, liquidity.publicKey, podium, free.map((k) => k.publicKey))], [authority]);
     assert.equal((await bal(passHolder.publicKey)) - b, first);
@@ -263,7 +289,7 @@ describe("goshi-escrow native", () => {
     assert.equal((await getRoom(id))!.state, "active");
     const infraBefore = await bal(infra.publicKey);
     await run([g.finalizeRoyale(authority.publicKey, id, infra.publicKey, liquidity.publicKey, paid.slice(0, 3).map((k) => k.publicKey), [])], [authority]);
-    const rake = 10n * SOL - pct(10n * SOL, 88n);
+    const rake = 10n * SOL - pct(10n * SOL, 95n);
     assert.equal((await bal(infra.publicKey)) - infraBefore, pct(rake, 15n));
     await run([g.setRequiredSaboteurs(guardian.publicKey, 3)], [guardian]);
   });
@@ -276,8 +302,8 @@ describe("goshi-escrow native", () => {
     const before = await Promise.all(ranking.map(bal));
     await run([g.finalizeVs(authority.publicKey, id, infra.publicKey, liquidity.publicKey, ranking)], [authority]);
     const pot = 3n * SOL;
-    const loser = pct(SOL - pct(SOL, 10n), 80n);
-    assert.equal((await bal(ranking[0])) - before[0], pot - pct(pot, 10n) - 2n * loser);
+    const loser = pct(SOL - pct(SOL, 3n), 80n);
+    assert.equal((await bal(ranking[0])) - before[0], pot - pct(pot, 3n) - 2n * loser);
     assert.equal((await bal(ranking[1])) - before[1], loser);
     assert.equal((await bal(ranking[2])) - before[2], loser);
     assert.equal(await getRoom(id), null);
@@ -380,7 +406,7 @@ describe("goshi-escrow native", () => {
     assert.equal(await getRoom(id), null, "and the room settled");
     // The share that could not be paid is in the super pot.
     const nominal = 10n * fee;
-    const pool = pct(nominal, 88n);
+    const pool = pct(nominal, 95n);
     const rake = nominal - pool - each * 3n;
     const jackpot = rake - pct(rake, 10n) - pct(rake, 15n) - pct(rake, 25n);
     const v1 = decodeVault((await conn.getAccountInfo(g.pda.vault))!.data)!;
@@ -457,5 +483,71 @@ describe("goshi-escrow native", () => {
     assert.equal((await bal(dest.publicKey)) - before, pending);
     const v1 = decodeVault((await conn.getAccountInfo(g.pda.vault))!.data)!;
     assert.equal(v1.openBurn + v1.openJackpot, 0n);
+  });
+  test("v6 backpacks: kept apart from the pot, capped at the entry, spent part to the trap pots, the rest back", async () => {
+    const fee = SOL / 10n;
+    const id = await newRoom(fee);
+    const p = paid.slice(0, 3);
+    await expectCode(run([g.joinRoom(p[0].publicKey, id, fee + 1n)], [p[0]]), "BadBackpack");
+    await run([g.joinRoom(p[0].publicKey, id, fee)], [p[0]]);
+    await run([g.joinRoom(p[1].publicKey, id, fee / 2n)], [p[1]]);
+    await run([g.joinRoom(p[2].publicKey, id)], [p[2]]);
+    const r = (await getRoom(id))!;
+    assert.deepEqual(r.backpacks, [fee, fee / 2n, 0n]);
+    await run([g.startVs(authority.publicKey, id)], [authority]);
+    const ranking = p.map((k) => k.publicKey);
+    await expectCode(run([g.finalizeVs(authority.publicKey, id, infra.publicKey, liquidity.publicKey, ranking)], [authority]), "BackpackOpen");
+    await expectCode(run([g.settleBackpacks(authority.publicKey, id, ranking, [fee + 1n, 0n, 0n])], [authority]), "BadBackpack");
+    await expectCode(run([g.settleBackpacks(outsider.publicKey, id, ranking, [0n, 0n, 0n])], [outsider]), "Unauthorized");
+    const before = await Promise.all(ranking.map(bal));
+    const t0 = (await conn.getAccountInfo(g.pda.traps)) ? decodeTraps((await conn.getAccountInfo(g.pda.traps))!.data)! : { maintenance: 0n, project: 0n };
+    const spent = [fee / 10n, fee / 20n, 0n];
+    await run([g.settleBackpacks(authority.publicKey, id, ranking, spent)], [authority]);
+    const after_ = await Promise.all(ranking.map(bal));
+    assert.equal(after_[0] - before[0], fee - fee / 10n);
+    assert.equal(after_[1] - before[1], fee / 2n - fee / 20n);
+    assert.equal(after_[2] - before[2], 0n);
+    const t1 = decodeTraps((await conn.getAccountInfo(g.pda.traps))!.data)!;
+    const total = spent[0] + spent[1];
+    assert.equal(t1.maintenance - t0.maintenance, total / 2n);
+    assert.equal(t1.project - t0.project, total - total / 2n);
+    // Now the room settles as usual, and the pot never saw the backpacks.
+    const b2 = await Promise.all(ranking.map(bal));
+    await run([g.finalizeVs(authority.publicKey, id, infra.publicKey, liquidity.publicKey, ranking)], [authority]);
+    const loser = pct(fee - pct(fee, 3n), 80n);
+    assert.equal((await bal(ranking[1])) - b2[1], loser);
+    assert.equal(await getRoom(id), null);
+  });
+
+  test("v6 backpacks: cancel gives the entry and the whole backpack back", async () => {
+    const fee = SOL / 10n;
+    const id = await newRoom(fee);
+    const b = await bal(paid[4].publicKey);
+    await run([g.joinRoom(paid[4].publicKey, id, fee / 4n)], [paid[4]]);
+    await run([g.cancelRoom(authority.publicKey, id, [paid[4].publicKey])], [authority]);
+    assert.ok(b - (await bal(paid[4].publicKey)) < 20_000n, "only the network fee is gone");
+  });
+
+  test("v6 trap pots: paid only above the minimum, only to the config wallets, by the authority or the guardian", async () => {
+    await expectCode(run([g.flushTraps(outsider.publicKey, infra.publicKey, liquidity.publicKey)], [outsider]), "Unauthorized");
+    await expectCode(run([g.flushTraps(authority.publicKey, outsider.publicKey, liquidity.publicKey)], [authority]), "WrongAccount");
+    const t = decodeTraps((await conn.getAccountInfo(g.pda.traps))!.data)!;
+    assert.ok(t.maintenance < TRAP_FLUSH_MIN && t.project < TRAP_FLUSH_MIN);
+    await expectCode(run([g.flushTraps(authority.publicKey, infra.publicKey, liquidity.publicKey)], [authority]), "NothingPending");
+    // Fill the pots past the minimum with a room where everybody spends the whole backpack.
+    const fee = SOL / 5n;
+    const id = await newRoom(fee);
+    const p = paid.slice(5, 7);
+    for (const k of p) await run([g.joinRoom(k.publicKey, id, fee)], [k]);
+    await run([g.startVs(authority.publicKey, id)], [authority]);
+    await run([g.settleBackpacks(authority.publicKey, id, p.map((k) => k.publicKey), [fee, fee])], [authority]);
+    const t2 = decodeTraps((await conn.getAccountInfo(g.pda.traps))!.data)!;
+    const bi = await bal(infra.publicKey), bl = await bal(liquidity.publicKey);
+    await run([g.flushTraps(guardian.publicKey, infra.publicKey, liquidity.publicKey)], [guardian]);
+    assert.equal((await bal(infra.publicKey)) - bi, t2.maintenance);
+    assert.equal((await bal(liquidity.publicKey)) - bl, t2.project);
+    const t3 = decodeTraps((await conn.getAccountInfo(g.pda.traps))!.data)!;
+    assert.deepEqual([t3.maintenance, t3.project], [0n, 0n]);
+    await run([g.finalizeVs(authority.publicKey, id, infra.publicKey, liquidity.publicKey, p.map((k) => k.publicKey))], [authority]);
   });
 });

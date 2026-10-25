@@ -4,7 +4,8 @@
 //!
 //! Accounts (all owned by this program, first byte is a type tag):
 //!   Config  PDA ["config"]            tag 1, 172 bytes
-//!   Room    PDA ["room", id u64 LE]   tag 2, 487 bytes
+//!   Room    PDA ["room", id u64 LE]   tag 2, 567 bytes (487 before v6, no backpacks)
+//!   Traps   PDA ["traps"]             tag 4, 18 bytes (v6: trap money waiting to be paid, maintenance and project)
 //!   Vault   PDA ["vault"]             tag 3, 18 bytes (holds the house shares in lamports above its rent)
 //!
 //! Two keys. The `authority` is the hot key of the game server: it opens rooms and settles them. The `guardian` is a cold key
@@ -29,6 +30,11 @@
 //!      to its payer. The player's way out if the server is gone.
 //!   18 set_guardian    (the current guardian AND the new one both sign)
 //!   19 migrate_config  (v4 config of 140 bytes to v5 of 172: authority and the new guardian sign)
+//!   20 settle_backpacks(spent n x u64)  v6: each backpack pays what was spent on traps and gets the rest back (before settling)
+//!   21 flush_traps     v6: pays the trap pots to the house wallets once each holds TRAP_FLUSH_MIN
+//!   22 finalize_bags(paid_n x u64 [, proof 128])  v7: a royale paid by bag. Every paid seat gets what its bag holds (seat order);
+//!      the sum may not exceed 97 percent of the cash, the house keeps 3, and what nobody was paid goes to the jackpot
+//!   4 join_room takes an optional backpack (u64, at most the entry fee) after the room id
 //!
 //! Proof logs (no state, no rent): `create_room` logs the seed commitment, and the finalize instructions log
 //!   proof = seed_reveal 32 | blockhash 32 | price_snapshot_hash 32 | replay_root 32
@@ -69,6 +75,8 @@ pub const MAX_VS: usize = 9;
 /// A duel is a private room of 2 to 5 players where the winner takes everything but a small house fee.
 pub const MAX_DUEL: usize = 5;
 pub const DUEL_RAKE_PCT: u64 = 3;
+/// The house fee of a VS match (percent of the pot). Was 10 until v6.
+pub const VS_RAKE_PCT: u64 = 3;
 
 const TAG_CONFIG: u8 = 1;
 const TAG_ROOM: u8 = 2;
@@ -76,7 +84,11 @@ const TAG_VAULT: u8 = 3;
 
 const CONFIG_LEN: usize = 172;
 const LEGACY_CONFIG_LEN: usize = 140;
-const ROOM_LEN: usize = 487;
+const ROOM_LEN: usize = 567;
+/// Rooms made before v6 have no backpacks (487 bytes); they can still be joined, settled and refunded.
+const LEGACY_ROOM_LEN: usize = 487;
+const TAG_TRAPS: u8 = 4;
+const TRAPS_LEN: usize = 18;
 const VAULT_LEN: usize = 18;
 
 /// A room that is still unsettled this long after its creation can be refunded by anybody (the server settles or refunds
@@ -121,6 +133,12 @@ pub enum E {
     AlreadyInitialized,
     BadInstruction,
     TooEarly,
+    /// v6: a backpack is still open; `settle_backpacks` must run before the room is settled.
+    BackpackOpen,
+    /// v6: more spent from a backpack than it holds, or a reserve above the cap.
+    BadBackpack,
+    /// v7: the bags ask for more than the room may pay to its players.
+    BagsTooBig,
 }
 impl From<E> for ProgramError {
     fn from(e: E) -> Self {
@@ -166,6 +184,14 @@ const R_FREE: usize = 375;
 const R_CREATED: usize = 471;
 /// Slot in which the room became active (0 while waiting).
 const R_SLOT: usize = 479;
+/// v6: the backpack of every paid seat (lamports in reserve for traps), in seat order.
+const R_RES: usize = 487;
+// Traps account offsets: what the traps bought, waiting to be paid (half maintenance, half project).
+const T_MAINT: usize = 1;
+const T_PROJECT: usize = 9;
+const T_BUMP: usize = 17;
+/// The trap pots are paid out only once they hold at least this much (no tiny payments).
+pub const TRAP_FLUSH_MIN: u64 = 50_000_000;
 // Vault offsets
 const V_BURN: usize = 1;
 const V_JACKPOT: usize = 9;
@@ -285,7 +311,11 @@ fn room_id_of(room: &AccountInfo) -> R<u64> {
 
 /// Loads the room, checks its owner, tag and PDA.
 fn check_room(room: &AccountInfo, program: &Pubkey) -> R {
-    check_owned(room, program, TAG_ROOM, ROOM_LEN)?;
+    if room.data_len() == LEGACY_ROOM_LEN {
+        check_owned(room, program, TAG_ROOM, LEGACY_ROOM_LEN)?;
+    } else {
+        check_owned(room, program, TAG_ROOM, ROOM_LEN)?;
+    }
     let (id, bump) = {
         let d = room.try_borrow_data()?;
         (rd_u64(&d, R_ID), d[R_BUMP])
@@ -309,6 +339,14 @@ fn free_list(d: &[u8]) -> ([Pubkey; MAX_FREE], usize) {
     }
     (out, n)
 }
+/// The backpack of paid seat `i` (0 in a room made before v6).
+fn reserve_of(d: &[u8], i: usize) -> u64 {
+    if d.len() < ROOM_LEN { 0 } else { rd_u64(d, R_RES + 8 * i) }
+}
+fn backpacks_open(d: &[u8]) -> bool {
+    (0..MAX_PAID).any(|i| reserve_of(d, i) != 0)
+}
+
 fn contains(list: &[Pubkey], n: usize, k: &Pubkey) -> bool {
     list[..n].iter().any(|x| x == k)
 }
@@ -347,11 +385,13 @@ pub struct Royale {
 }
 
 pub fn settle_royale(nominal: u64, cash: u64, saboteurs: u64) -> Option<Royale> {
-    let prize_pool = pct(nominal, 88)?;
+    // Rules v6: 95 percent of what the room really holds to the podium and 2 to the saboteurs; the house keeps 3.
+    let _ = nominal;
+    let prize_pool = pct(cash, 95)?;
     let first = pct(prize_pool, 60)?;
     let second = pct(prize_pool, 25)?;
     let third = prize_pool.checked_sub(first)?.checked_sub(second)?;
-    let sab_pool = pct(nominal, 2)?;
+    let sab_pool = pct(cash, 2)?;
     let (each, total) = if saboteurs == 0 {
         (0, 0)
     } else {
@@ -369,6 +409,12 @@ pub fn settle_royale(nominal: u64, cash: u64, saboteurs: u64) -> Option<Royale> 
     })
 }
 
+/// v7 (paid by bag): the house keeps 3 percent of the cash, the players share at most the other 97.
+pub const BAGS_RAKE_PCT: u64 = 3;
+pub fn bags_pool(cash: u64) -> Option<u64> {
+    cash.checked_sub(pct(cash, BAGS_RAKE_PCT)?)
+}
+
 pub struct Vs {
     pub rake: u64,
     pub burn: u64,
@@ -384,8 +430,8 @@ pub fn settle_vs(entry: u64, players: u64) -> Option<Vs> {
         return None;
     }
     let pot = entry.checked_mul(players)?;
-    let rake = pct(pot, 10)?;
-    let net = entry.checked_sub(pct(entry, 10)?)?;
+    let rake = pct(pot, VS_RAKE_PCT)?;
+    let net = entry.checked_sub(pct(entry, VS_RAKE_PCT)?)?;
     let loser = pct(net, 80)?;
     let winner = pot.checked_sub(rake)?.checked_sub(loser.checked_mul(players - 1)?)?;
     let burn = pct(rake, 10)?;
@@ -443,6 +489,9 @@ fn process_instruction(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
         17 => refund_expired(program, accounts),
         18 => set_guardian(program, accounts),
         19 => migrate_config(program, accounts),
+        20 => settle_backpacks(program, accounts, rest),
+        21 => flush_traps(program, accounts),
+        22 => finalize_bags(program, accounts, rest),
         _ => Err(E::BadInstruction.into()),
     }
 }
@@ -627,10 +676,19 @@ fn join_room(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
         }
         fee = rd_u64(&r, R_FEE);
     }
-    Transfer { from: player, to: room, lamports: fee }.invoke()?;
+    // v6: an optional backpack after the room id, at most one entry fee, refunded in full when it is not spent.
+    let reserve = if d.len() >= 16 { rd_u64(d, 8) } else { 0 };
+    if reserve > 0 && (room.data_len() < ROOM_LEN || reserve > fee) {
+        return Err(E::BadBackpack.into());
+    }
+    let total = fee.checked_add(reserve).ok_or(ProgramError::from(E::MathOverflow))?;
+    Transfer { from: player, to: room, lamports: total }.invoke()?;
     let mut r = room.try_borrow_mut_data()?;
     let n = r[R_PAID_LEN] as usize;
     r[R_PAID + 32 * n..R_PAID + 32 * n + 32].copy_from_slice(player.key());
+    if reserve > 0 {
+        wr_u64(&mut r, R_RES + 8 * n, reserve);
+    }
     r[R_PAID_LEN] = (n + 1) as u8;
     maybe_activate(&mut r, cfg.req_sab)?;
     Ok(())
@@ -932,6 +990,9 @@ fn finalize_royale(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResu
     require_authority(authority, &cfg.auth)?;
     check_room(room, program)?;
     check_vault(vault, program)?;
+    if backpacks_open(&room.try_borrow_data()?) {
+        return Err(E::BackpackOpen.into());
+    }
     if *infra.key() != cfg.infra || *liquidity.key() != cfg.liq {
         return Err(E::WrongAccount.into());
     }
@@ -985,6 +1046,65 @@ fn finalize_royale(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResu
     close_room(room, authority)
 }
 
+// accounts: authority(s,w), config, room(w), vault(w), infra(w), liquidity(w), then every paid wallet in seat order
+fn finalize_bags(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
+    if a.len() < 6 {
+        return Err(E::BadAccounts.into());
+    }
+    let (authority, config, room, vault, infra, liquidity) = (&a[0], &a[1], &a[2], &a[3], &a[4], &a[5]);
+    let remaining = &a[6..];
+    let cfg = load_config(config, program)?;
+    require_authority(authority, &cfg.auth)?;
+    check_room(room, program)?;
+    check_vault(vault, program)?;
+    if backpacks_open(&room.try_borrow_data()?) {
+        return Err(E::BackpackOpen.into());
+    }
+    if *infra.key() != cfg.infra || *liquidity.key() != cfg.liq {
+        return Err(E::WrongAccount.into());
+    }
+    let (fee, paid, paid_n, passes) = {
+        let r = room.try_borrow_data()?;
+        if r[R_STATE] != 1 || r[R_MODE] != 0 {
+            return Err(E::RoomNotActive.into());
+        }
+        let (paid, pn) = paid_list(&r);
+        (rd_u64(&r, R_FEE), paid, pn, r[R_PASSES] as u64)
+    };
+    if remaining.len() != paid_n || d.len() < 8 * paid_n {
+        return Err(E::BadAccounts.into());
+    }
+    let cash = fee.checked_mul(paid_n as u64 - passes).ok_or(ProgramError::from(E::MathOverflow))?;
+    let pool = bags_pool(cash).ok_or(ProgramError::from(E::MathOverflow))?;
+    let mut sum = 0u64;
+    for i in 0..paid_n {
+        sum = sum.checked_add(rd_u64(d, 8 * i)).ok_or(ProgramError::from(E::MathOverflow))?;
+    }
+    if sum > pool {
+        return Err(E::BagsTooBig.into());
+    }
+    let mut redirected = pool - sum;
+    for i in 0..paid_n {
+        let acc = &remaining[i];
+        if *acc.key() != paid[i] || !acc.is_writable() {
+            return Err(E::WrongAccount.into());
+        }
+        redirected = redirected.checked_add(pay_wallet(room, acc, rd_u64(d, 8 * i))?).ok_or(ProgramError::from(E::MathOverflow))?;
+    }
+    let rake = cash - pool;
+    let burn = pct(rake, 10).ok_or(ProgramError::from(E::MathOverflow))?;
+    let infra_amt = pct(rake, 15).ok_or(ProgramError::from(E::MathOverflow))?;
+    let liq = pct(rake, 25).ok_or(ProgramError::from(E::MathOverflow))?;
+    let jackpot = rake - burn - infra_amt - liq;
+    pay_house(room, vault, infra, liquidity, infra_amt, liq, burn, jackpot, redirected)?;
+    let p = 8 * paid_n;
+    if d.len() >= p + 128 {
+        let slot = room_slot_of(room)?;
+        emit(b"goshi:proof", room_id_of(room)?, &[&d[p..p + 32], &d[p + 32..p + 64], &d[p + 64..p + 96], &d[p + 96..p + 128], &slot]);
+    }
+    close_room(room, authority)
+}
+
 // accounts: authority(s,w), config, room(w), vault(w), infra(w), liquidity(w), then every paid wallet in ranking order
 fn finalize_vs(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
     if a.len() < 6 {
@@ -996,6 +1116,9 @@ fn finalize_vs(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
     require_authority(authority, &cfg.auth)?;
     check_room(room, program)?;
     check_vault(vault, program)?;
+    if backpacks_open(&room.try_borrow_data()?) {
+        return Err(E::BackpackOpen.into());
+    }
     if *infra.key() != cfg.infra || *liquidity.key() != cfg.liq {
         return Err(E::WrongAccount.into());
     }
@@ -1052,6 +1175,9 @@ fn finalize_duel(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult
     require_authority(authority, &cfg.auth)?;
     check_room(room, program)?;
     check_vault(vault, program)?;
+    if backpacks_open(&room.try_borrow_data()?) {
+        return Err(E::BackpackOpen.into());
+    }
     if *infra.key() != cfg.infra || *liquidity.key() != cfg.liq {
         return Err(E::WrongAccount.into());
     }
@@ -1100,7 +1226,8 @@ fn refund_paid(room: &AccountInfo, remaining: &[AccountInfo]) -> R {
         if *acc.key() != paid[i] || !acc.is_writable() {
             return Err(E::WrongAccount.into());
         }
-        pay_wallet(room, acc, fee)?;
+        let back = fee.checked_add(reserve_of(&room.try_borrow_data()?, i)).ok_or(ProgramError::from(E::MathOverflow))?;
+        pay_wallet(room, acc, back)?;
         k += 1;
     }
     if k != remaining.len() {
@@ -1146,6 +1273,113 @@ fn refund_expired(program: &Pubkey, a: &[AccountInfo]) -> ProgramResult {
     close_room(room, rent_to)
 }
 
+fn traps_pda(program: &Pubkey) -> (Pubkey, u8) {
+    find_program_address(&[b"traps"], program)
+}
+
+// accounts: authority(s,w), config, room(w), traps(w), system, then every paid wallet in seat order (w)
+// data: spent n x u64 in seat order. Each backpack pays what its owner spent on traps into the traps account (half for
+// maintenance, half for the project) and gets the rest back. Runs once, before the room is settled.
+fn settle_backpacks(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
+    if a.len() < 5 {
+        return Err(E::BadAccounts.into());
+    }
+    let (authority, config, room, traps) = (&a[0], &a[1], &a[2], &a[3]);
+    let wallets = &a[5..];
+    let cfg = load_config(config, program)?;
+    require_authority(authority, &cfg.auth)?;
+    check_room(room, program)?;
+    let (paid, pn, reserves) = {
+        let r = room.try_borrow_data()?;
+        if r.len() < ROOM_LEN {
+            return Err(E::BadBackpack.into());
+        }
+        let (paid, pn) = paid_list(&r);
+        let mut res = [0u64; MAX_PAID];
+        for (i, x) in res.iter_mut().enumerate().take(pn) {
+            *x = reserve_of(&r, i);
+        }
+        (paid, pn, res)
+    };
+    if wallets.len() != pn || d.len() != 8 * pn {
+        return Err(E::BadAccounts.into());
+    }
+    // The traps account is made the first time (the authority pays its small deposit).
+    let (tkey, tbump) = traps_pda(program);
+    if tkey != *traps.key() {
+        return Err(E::WrongAccount.into());
+    }
+    if traps.data_len() == 0 {
+        create_pda(authority, traps, program, TRAPS_LEN, &[Seed::from(b"traps"), Seed::from(&[tbump])])?;
+        let mut t = traps.try_borrow_mut_data()?;
+        t[0] = TAG_TRAPS;
+        t[T_BUMP] = tbump;
+    }
+    check_owned(traps, program, TAG_TRAPS, TRAPS_LEN)?;
+    let mut spent_total = 0u64;
+    let mut dust = 0u64;
+    for i in 0..pn {
+        let spent = rd_u64(d, 8 * i);
+        if spent > reserves[i] {
+            return Err(E::BadBackpack.into());
+        }
+        let acc = &wallets[i];
+        if *acc.key() != paid[i] || !acc.is_writable() {
+            return Err(E::WrongAccount.into());
+        }
+        spent_total = spent_total.checked_add(spent).ok_or(ProgramError::from(E::MathOverflow))?;
+        dust = dust.checked_add(pay_wallet(room, acc, reserves[i] - spent)?).ok_or(ProgramError::from(E::MathOverflow))?;
+    }
+    let to_traps = spent_total.checked_add(dust).ok_or(ProgramError::from(E::MathOverflow))?;
+    move_lamports(room, traps, to_traps)?;
+    {
+        let mut t = traps.try_borrow_mut_data()?;
+        let half = spent_total / 2;
+        let m = rd_u64(&t, T_MAINT).checked_add(half).ok_or(ProgramError::from(E::MathOverflow))?;
+        let p = rd_u64(&t, T_PROJECT).checked_add(to_traps - half).ok_or(ProgramError::from(E::MathOverflow))?;
+        wr_u64(&mut t, T_MAINT, m);
+        wr_u64(&mut t, T_PROJECT, p);
+    }
+    let mut r = room.try_borrow_mut_data()?;
+    for i in 0..MAX_PAID {
+        wr_u64(&mut r, R_RES + 8 * i, 0);
+    }
+    emit(b"goshi:traps", rd_u64(&r, R_ID), &[&spent_total.to_le_bytes()]);
+    Ok(())
+}
+
+// accounts: signer(s) (the authority or the guardian), config, traps(w), infra(w), liquidity(w)
+// Pays each trap pot to its house wallet (maintenance to infra, project to liquidity) once it holds TRAP_FLUSH_MIN or more.
+// The wallets come from the config, so the hot key can only send the money where the guardian said.
+fn flush_traps(program: &Pubkey, a: &[AccountInfo]) -> ProgramResult {
+    let [signer, config, traps, infra, liquidity] = a else { return Err(E::BadAccounts.into()) };
+    let cfg = load_config(config, program)?;
+    if !signer.is_signer() || (*signer.key() != cfg.auth && *signer.key() != cfg.guardian) {
+        return Err(E::Unauthorized.into());
+    }
+    check_owned(traps, program, TAG_TRAPS, TRAPS_LEN)?;
+    let bump = traps.try_borrow_data()?[T_BUMP];
+    check_pda(traps, &[b"traps", &[bump]], program)?;
+    if *infra.key() != cfg.infra || *liquidity.key() != cfg.liq {
+        return Err(E::WrongAccount.into());
+    }
+    let (m, p) = {
+        let t = traps.try_borrow_data()?;
+        (rd_u64(&t, T_MAINT), rd_u64(&t, T_PROJECT))
+    };
+    let pay_m = if m >= TRAP_FLUSH_MIN { m } else { 0 };
+    let pay_p = if p >= TRAP_FLUSH_MIN { p } else { 0 };
+    if pay_m == 0 && pay_p == 0 {
+        return Err(E::NothingPending.into());
+    }
+    move_lamports(traps, infra, pay_m)?;
+    move_lamports(traps, liquidity, pay_p)?;
+    let mut t = traps.try_borrow_mut_data()?;
+    wr_u64(&mut t, T_MAINT, m - pay_m);
+    wr_u64(&mut t, T_PROJECT, p - pay_p);
+    Ok(())
+}
+
 // accounts: guardian(s), config, vault(w), destination(w)
 fn withdraw_vault(program: &Pubkey, a: &[AccountInfo], d: &[u8]) -> ProgramResult {
     let [guardian, config, vault, dest] = a else { return Err(E::BadAccounts.into()) };
@@ -1175,18 +1409,19 @@ mod tests {
     #[test]
     fn royale_standard_room() {
         let s = settle_royale(10 * SOL, 10 * SOL, 3).unwrap();
-        assert_eq!(s.prizes, [5_280_000_000, 2_200_000_000, 1_320_000_000]);
+        assert_eq!(s.prizes, [5_700_000_000, 2_375_000_000, 1_425_000_000]);
         assert_eq!(s.saboteur_each, 66_666_666);
         assert_eq!(s.prizes.iter().sum::<u64>() + s.saboteur_total + s.rake, 10 * SOL);
         assert_eq!(s.buyback_burn + s.infra + s.liquidity + s.rake_jackpot, s.rake);
     }
 
     #[test]
-    fn pass_seat_is_solvent_and_two_are_refused() {
+    fn pass_seat_is_solvent() {
+        // v6: the prizes come from the cash, so a pass seat (one entry less in cash) still leaves the house its 3 percent.
         let fee = 7_500_000_000u64;
         let s = settle_royale(fee * 10, fee * 9, 3).unwrap();
-        assert!(s.rake <= 3);
-        assert!(settle_royale(fee * 10, fee * 8, 3).is_none());
+        assert_eq!(s.prizes.iter().sum::<u64>() + s.saboteur_total + s.rake, fee * 9);
+        assert!(s.rake >= fee * 9 * 3 / 100);
     }
 
     #[test]
@@ -1196,7 +1431,7 @@ mod tests {
             assert_eq!(s.winner + s.loser * (n - 1) + s.rake, 123_456_789 * n);
         }
         let s = settle_vs(SOL, 2).unwrap();
-        assert_eq!((s.loser, s.winner), (720_000_000, 1_080_000_000));
+        assert_eq!((s.loser, s.winner, s.rake), (776_000_000, 1_164_000_000, 60_000_000));
     }
 
     #[test]

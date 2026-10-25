@@ -10,7 +10,7 @@ export const SKIN_HOLD_USD: Readonly<Record<string, number>> = {
 };
 
 export const OPEN_SKINS: readonly string[] = [
-  "classic", "mint", "coral", "sky", "stripes", "candy", "neon", "sunset", "galaxy", "gold", "ember", "aurora", "pepe", "shiba", "doge", "bonk", "popcat", "wif",
+  "classic", "mint", "coral", "sky", "stripes", "candy", "neon", "sunset", "galaxy", "gold", "ember", "aurora", "pepe", "shiba", "doge", "bonk", "popcat", "wif", "fox", "bitcoin", "ethereum", "solana", "laser-eyes", "whale", "degen", "rugged", "moonboy", "panda",
 ];
 
 export const isKnownSkin = (id: unknown): id is string =>
@@ -20,3 +20,6 @@ export const isKnownSkin = (id: unknown): id is string =>
 export const FOUNDER_SKINS: readonly string[] = ["ceo"];
 const FOUNDERS = new Set((process.env.FOUNDER_WALLETS ?? "").split(",").map((x) => x.trim()).filter(Boolean));
 export const isFounder = (wallet: string | undefined): boolean => !!wallet && FOUNDERS.has(wallet);
+
+/** The skins the bots wear, one each in turn: the memes and coins, so a room looks alive (cosmetic only). */
+export const BOT_SKINS: readonly string[] = ["pepe", "doge", "bitcoin", "shiba", "ethereum", "bonk", "solana", "popcat", "whale", "wif", "fox", "degen", "laser-eyes", "moonboy", "rugged", "panda"];

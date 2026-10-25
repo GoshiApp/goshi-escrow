@@ -58,25 +58,29 @@ export async function fillWithBots(roomId: string, paid: number, free: number): 
   const wantPaid = Math.min(paid, config.paidSlots - room.paid.length);
   const done = { paid: 0, free: 0 };
 
-  // Saboteurs first: a room turns active the moment the tenth paid seat is taken.
-  for (let i = 0; i < wantFree; i++) {
-    const bot = nextBot(inRoom);
-    await topUpSol(bot.publicKey, 0.01 * LAMPORTS_PER_SOL, 0.02 * LAMPORTS_PER_SOL);
-    if ((await goshiBalanceOf(bot.publicKey)) < config.minHolder) await mintTestTokens(bot.publicKey, config.minHolder * 2n);
-    await joinFreeAs(bot, roomId);
-    inRoom.add(bot.publicKey.toBase58());
-    done.free++;
-    log("bot_joined", { roomId, role: "saboteur", bot: bot.publicKey.toBase58() });
-  }
-  for (let i = 0; i < wantPaid; i++) {
-    const bot = nextBot(inRoom);
-    const need = Number(room.entryFee) + 0.02 * LAMPORTS_PER_SOL;
-    await topUpSol(bot.publicKey, need, need + 0.02 * LAMPORTS_PER_SOL);
-    await joinPaidAs(bot, roomId);
-    inRoom.add(bot.publicKey.toBase58());
-    done.paid++;
-    log("bot_joined", { roomId, role: "paid", bot: bot.publicKey.toBase58() });
-  }
+  // Saboteurs first: a room turns active the moment the tenth paid seat is taken. Every bot is picked first (no two the same),
+  // then each group joins in parallel: funding and joining one by one took close to a minute for a full room.
+  const sabs = Array.from({ length: wantFree }, () => { const bot = nextBot(inRoom); inRoom.add(bot.publicKey.toBase58()); return bot; });
+  const paids = Array.from({ length: wantPaid }, () => { const bot = nextBot(inRoom); inRoom.add(bot.publicKey.toBase58()); return bot; });
+  const need = Number(room.entryFee) + 0.02 * LAMPORTS_PER_SOL;
+  await Promise.all([
+    ...sabs.map(async (bot) => {
+      await topUpSol(bot.publicKey, 0.01 * LAMPORTS_PER_SOL, 0.02 * LAMPORTS_PER_SOL);
+      if ((await goshiBalanceOf(bot.publicKey)) < config.minHolder) await mintTestTokens(bot.publicKey, config.minHolder * 2n);
+    }),
+    ...paids.map((bot) => topUpSol(bot.publicKey, need, need + 0.02 * LAMPORTS_PER_SOL)),
+  ]);
+  const join = async (bot: Keypair, role: "saboteur" | "paid") => {
+    try {
+      if (role === "saboteur") await joinFreeAs(bot, roomId); else await joinPaidAs(bot, roomId);
+      if (role === "saboteur") done.free++; else done.paid++;
+      log("bot_joined", { roomId, role, bot: bot.publicKey.toBase58() });
+    } catch (e: any) {
+      log("bot_join_failed", { roomId, role, error: String(e?.message ?? e).slice(0, 120) });
+    }
+  };
+  await Promise.all(sabs.map((b) => join(b, "saboteur")));
+  await Promise.all(paids.map((b) => join(b, "paid")));
   return done;
 }
 
