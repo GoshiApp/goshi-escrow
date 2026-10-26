@@ -1,4 +1,5 @@
 import { ticketsOf } from "./cash-vault.js";
+import { leaderboard } from "./leaderboard.js";
 import { Arena, CASH_MIN_ENTRY } from "./game/arena.js";
 import crypto from "node:crypto";
 import { monitorEventLoopDelay } from "node:perf_hooks";
@@ -113,6 +114,14 @@ const server = http.createServer((req, res) => {
       (body) => { res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*", "cache-control": "no-store" }); res.end(body); },
       () => { res.writeHead(502, { "access-control-allow-origin": "*" }).end(); },
     );
+    return;
+  }
+  // The season ranking of the cash arenas (who won the most SOL). Public data, read only, cached a minute.
+  if ((req.url ?? "").split("?")[0] === "/leaderboard") {
+    void leaderboard().then((j) => {
+      res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*", "cache-control": "no-store" });
+      res.end(JSON.stringify(j));
+    });
     return;
   }
   // The VAR of the cash arena: every recorded clip, newest first, and any clip by its id. Public data, read only.
