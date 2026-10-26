@@ -495,11 +495,12 @@ export class Arena {
   /** Rules 6: a head on the exposed tail of the boss bites instead of dying (at most two bites a second per head). */
   private bossAt = new Map<string, number>();
   private bossBite(a: Player, b: Player, k: number, n: number, ev: StepResult): boolean {
-    if (this.rules < 6 || b !== this.bossNow || this.bossPhase().state !== "open" || (b.shieldUntil ?? 0) > this.time || k < n * BOSS_TAIL) return false;
+    // Cash arena: while exposed, the boss (the richest) can be bitten anywhere on its body, not only the tail, and a bite takes more.
+    if (this.rules < 6 || b !== this.bossNow || this.bossPhase().state !== "open" || (b.shieldUntil ?? 0) > this.time || (!this.cash && k < n * BOSS_TAIL)) return false;
     if ((this.bossAt.get(a.w) ?? -1) > this.time - 0.5) return true;
     this.bossAt.set(a.w, this.time);
     const pt = bodyPoints(b)[k] ?? [b.x, b.y];
-    this.chip(b, b.m * BOSS_BITE, a, 0.5, pt[0], pt[1], ev);
+    this.chip(b, b.m * BOSS_BITE * (this.cash ? 2.5 : 1), a, 0.5, pt[0], pt[1], ev);
     return true;
   }
   private bossNow: Player | null = null;
@@ -755,6 +756,8 @@ export class Arena {
     // Cash arena: a kill counts toward cashing out when the victim entered with at least as much as the killer.
     if (this.cash) {
       const k = this.player(by);
+      if (k && k !== p && k.bot) botLearn(k.w, true);
+      if (p.bot) botLearn(p.w, false);
       if (k && k !== p && this.entryOf(p) >= this.entryOf(k)) k.qk = (k.qk ?? 0) + 1;
       if (k && k !== p) this.cashKills++;
       // The killer takes CASH_KILL_CUT of the victim's bag straight away; the rest falls over the map.
@@ -1054,7 +1057,8 @@ export class Arena {
           const ddx = a.x - pts[k][0];
           const ddy = a.y - pts[k][1];
           // Cash arena: the contact you see is the contact that counts, so a big head dies as soon as it touches a body.
-          const lim = this.cash ? rb + ra * 0.8 : rb + ra * 0.35;
+          // Cash arena: a head dies when its edge touches the body's edge, exactly what the screen shows.
+          const lim = this.cash ? rb + ra * 0.95 : rb + ra * 0.35;
           if (ddx * ddx + ddy * ddy < lim * lim) {
             // Survival: a body at least three times heavier (and the team's own) is not killed by a small one's body: it eats
             // a bite of it, which is mass for the big one and a shorter body for the small one.
@@ -1456,6 +1460,13 @@ export class Arena {
 /** What a bot remembers between ticks: the orb it is going for and the heading it was steering. A bot that decides again every
  *  tick wobbles like a worm in a jar; one that commits to a target, turns at a human rate and only changes its mind for danger
  *  moves like a player. Kept outside the Player so the record and the snapshots are untouched. */
+/** Cash arena bots learn across lives: `bold` grows with each kill and shrinks with each death (0.6 to 1.6). */
+const cashMind = new Map<string, { bold: number }>();
+export function botLearn(w: string, killed: boolean): void {
+  const m = cashMind.get(w) ?? { bold: 1 };
+  m.bold = Math.max(0.6, Math.min(1.6, m.bold + (killed ? 0.08 : -0.05)));
+  cashMind.set(w, m);
+}
 const brainMem = new WeakMap<Player, { orb: number; until: number; ang: number; side: number; d0: number; t0: number; ban: Map<number, number>; prey: string; preyUntil: number; circDir: number; encT: number }>();
 
 function angDiff(a: number, b: number): number {
@@ -1494,7 +1505,7 @@ export function arenaBrain(a: Arena, me: Player): { dx: number; dy: number; boos
   const dc = Math.hypot(me.x - cx, me.y - cy);
 
   // The others: head and body points once per call.
-  const others: { w: string; pts: [number, number][]; r: number; heavier: boolean; hx: number; hy: number; prot: boolean; hd: number; m: number }[] = [];
+  const others: { w: string; pts: [number, number][]; r: number; heavier: boolean; hx: number; hy: number; prot: boolean; hd: number; m: number; bag: number; human: boolean }[] = [];
   // The live arenas (many bots, `brainEvery` > 1) look only at what is near: body points within 800 of the head, far beyond any
   // reach the brain tests, and the points of each body are worked out once per step for every bot.
   const light = a.brainEvery > 1;
@@ -1502,7 +1513,7 @@ export function arenaBrain(a: Arena, me: Player): { dx: number; dy: number; boos
     if (o === me || !o.alive) continue;
     let pts = light ? a.halfPoints(o) : bodyPoints(o).filter((_, k) => k % 2 === 0);
     if (light) { pts = pts.filter((q) => Math.abs(q[0] - me.x) < 800 && Math.abs(q[1] - me.y) < 800); if (!pts.length && Math.hypot(o.x - me.x, o.y - me.y) > 800) continue; }
-    others.push({ w: o.w, hd: o.heading, m: o.m, pts, r: bodyRadius(o.m), heavier: o.m > me.m * 0.95, hx: o.x, hy: o.y, prot: o.protectUntil > a.time });
+    others.push({ w: o.w, hd: o.heading, m: o.m, pts, r: bodyRadius(o.m), heavier: o.m > me.m * 0.95, hx: o.x, hy: o.y, prot: o.protectUntil > a.time, bag: o.bag ?? 0, human: !o.bot });
   }
 
   // Where it wants to go: back inside when the zone is close, else the best orb it has committed to.
@@ -1553,6 +1564,29 @@ export function arenaBrain(a: Arena, me: Player): { dx: number; dy: number; boos
     const home = Math.atan2(cy - me.y, cx - me.x);
     if (dc > zr * 0.55) want = home;
   }
+  // Cash arena: every bot hunts. Nobody is immune and a head that touches a body dies, so size does not protect anyone: the bot
+  // goes for whoever carries the most SOL (people first), cuts in front of its head instead of chasing its tail, and boosts in.
+  // It learns: a bot whose hunts end in kills grows bolder, one that keeps dying grows careful (kept per bot across lives).
+  if (a.cash && !nearEdge && me.m > 22) {
+    const mem = cashMind.get(me.w) ?? { bold: 1 };
+    cashMind.set(me.w, mem);
+    let best: (typeof others)[number] | undefined, bestS = 0, bestD = 0;
+    for (const o of others) {
+      if (o.prot) continue;
+      const dd = Math.hypot(o.hx - me.x, o.hy - me.y);
+      if (dd > P.huntRange * mem.bold) continue;
+      const sc = (1 + o.bag / Math.max(1, a.cashMin)) * (o.human ? 1.6 : 1) / (dd + 120);
+      if (sc > bestS) { bestS = sc; best = o; bestD = dd; }
+    }
+    if (best) {
+      // A point ahead of its head, a little to our side: our body ends up across its path.
+      const ahead = speedOf(best.m) * Math.min(1.1, bestD / 300) + 90;
+      const tx = best.hx + Math.cos(best.hd) * ahead, ty = best.hy + Math.sin(best.hd) * ahead;
+      want = Math.atan2(ty - me.y, tx - me.x);
+      preyW = best.w;
+      chasing = bestD < 450 * mem.bold;
+    }
+  } else
   if (!leading && !nearEdge && P.hunt > 0 && me.m > 30 && ((me.w.charCodeAt(me.w.length - 1) + me.w.charCodeAt(0)) % 100) / 100 < P.hunt) {
     let best: (typeof others)[number] | undefined, bestD = P.huntRange;
     for (const o of others) {
