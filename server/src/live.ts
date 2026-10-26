@@ -258,6 +258,8 @@ export class LiveArena {
     return null;
   }
 
+  /** Every look worn in this arena lately (kept after its player leaves, so a clip saved a moment later still has it). */
+  private lookSeen: Record<string, string> = {};
   private broadcastSkins(): void {
     const text = JSON.stringify({ t: "skins", map: Object.fromEntries(this.skins) });
     for (const c of this.subs) {
@@ -345,6 +347,7 @@ export class LiveArena {
     this.match.arena.claim(p, w, label);
     const skin = c.live!.skin ?? null;
     if (skin) this.skins.set(w, skin);
+    if (skin) { this.lookSeen[w] = skin; const k = Object.keys(this.lookSeen); if (k.length > 200) delete this.lookSeen[k[0]]; }
     this.broadcastSkins();
     p.ceo = c.wallet === CEO_WALLET;
     p.afk = false;
@@ -432,7 +435,7 @@ export class LiveArena {
   }
 
   /** Clips waiting for the two seconds after the death (the coins bursting and falling), then saved. */
-  private pendingClips: { meta: Omit<VarClip, "hash" | "frames" | "names" | "skins" | "id" | "at" | "cluster">; deathAt: number; c: Client | null }[] = [];
+  private pendingClips: { meta: Omit<VarClip, "hash" | "frames" | "names" | "skins" | "id" | "at" | "cluster">; deathAt: number; c: Client | null; skins: Record<string, string> }[] = [];
   private flushClips(): void {
     const now = Date.now();
     while (this.pendingClips.length && now - this.pendingClips[0].deathAt >= 2000) {
@@ -441,7 +444,7 @@ export class LiveArena {
       const frames = this.varFrames.filter((f) => f.t >= pc.deathAt - 8000 && f.t <= pc.deathAt + 2000);
       const names: Record<string, string> = {};
       for (const f of frames) for (const b of f.b) names[b[0]] = this.varNames.get(b[0]) ?? b[0];
-      const clip = saveClip({ id: `${pc.deathAt.toString(36)}-${crypto.randomBytes(3).toString("hex")}`, at: pc.deathAt, cluster: config.cluster, ...pc.meta, names, skins: Object.fromEntries(this.skins), frames });
+      const clip = saveClip({ id: `${pc.deathAt.toString(36)}-${crypto.randomBytes(3).toString("hex")}`, at: pc.deathAt, cluster: config.cluster, ...pc.meta, names, skins: { ...pc.skins, ...Object.fromEntries(this.skins) }, frames });
       // The player hears the id of its clip, so its own history (and the VAR button) can open it.
       if (pc.c) this.send(pc.c, { t: "varClip", id: clip.id, kind: clip.kind, bag: clip.bag, at: clip.at, hash: clip.hash });
     }
@@ -478,7 +481,7 @@ export class LiveArena {
       if (!human(ev.w) && !human(ev.by)) continue;
       const slot = this.slots.find((sl) => sl.client && sl.humanW === ev.w);
       // Where it happened: the head of the body just before, so the replay can mark the spot.
-      this.pendingClips.push({ deathAt: frame.t, c: slot?.client ?? null, meta: { victim: ev.w, by: ev.by, kind: cashing ? "cashout" : "eliminated", bag, entry, ...(before ? { spot: [before[1], before[2]] as [number, number] } : {}) } });
+      this.pendingClips.push({ deathAt: frame.t, c: slot?.client ?? null, skins: { ...this.lookSeen, ...Object.fromEntries(this.skins) }, meta: { victim: ev.w, by: ev.by, kind: cashing ? "cashout" : "eliminated", bag, entry, ...(before ? { spot: [before[1], before[2]] as [number, number] } : {}) } });
     }
     this.flushClips();
   }
