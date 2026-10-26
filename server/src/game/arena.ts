@@ -1369,9 +1369,10 @@ export class Arena {
   cashCap(p: Player): number { return (p.entry ?? this.cashMin) * (1 + (p.qk ?? 0)); }
   /** Cash arena: bag above the cash out cap, to fall over the map at the next step. */
   private pendingSpill: number[] = [];
-  /** Cash arena: the entry of this arena (a bot that has not paid counts as having entered with it). */
+  /** Cash arena: the entry of this arena. */
   cashMin = CASH_MIN_ENTRY;
-  entryOf(p: Player): number { return p.entry ?? (p.bot ? this.cashMin : 0); }
+  // Only what was really paid counts: a body (bot or person) that entered with nothing is worth nothing to eliminate.
+  entryOf(p: Player): number { return p.entry ?? 0; }
   cashEnter(p: Player, entry: number): StepResult {
     const ev: StepResult = { eatenOrbs: [], newOrbs: [], deaths: [] };
     // The bag is kept: whatever it ate before its entry was confirmed is real SOL from the map and stays its own.

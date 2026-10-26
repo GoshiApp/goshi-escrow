@@ -24,7 +24,7 @@ export async function initVault(): Promise<Keypair> {
   return vaultKp;
 }
 
-async function send(from: Keypair, to: PublicKey, lamports: number, payer: Keypair = from): Promise<string> {
+async function send(from: Keypair, to: PublicKey, lamports: number, payer: Keypair = from, onSent?: (sig: string) => void): Promise<string> {
   const { connection } = await chain();
   const tx = new Transaction().add(SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: to, lamports }));
   tx.feePayer = payer.publicKey;
@@ -32,6 +32,7 @@ async function send(from: Keypair, to: PublicKey, lamports: number, payer: Keypa
   tx.recentBlockhash = blockhash;
   tx.sign(...(payer === from ? [from] : [payer, from]));
   const sig = await connection.sendRawTransaction(tx.serialize());
+  onSent?.(sig);
   await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
   return sig;
 }
@@ -104,6 +105,17 @@ async function paidOf(sig: string, tries = 10): Promise<Paid | undefined> {
 export async function checkEntry(sig: string, wallet: string, min: number): Promise<{ ok: true; lamports: number } | { ok: false; why: string }> {
   if (!devnet) return { ok: false, why: "devnet_only" };
   if (!/^[1-9A-HJ-NP-Za-km-z]{64,90}$/.test(sig)) return { ok: false, why: "bad" };
+  // One check at a time per ticket: two requests with the same signature at once can never both get a place.
+  if (checking.has(sig)) return { ok: false, why: "used" };
+  checking.add(sig);
+  try {
+    return await checkOnce(sig, wallet, min);
+  } finally {
+    checking.delete(sig);
+  }
+}
+const checking = new Set<string>();
+async function checkOnce(sig: string, wallet: string, min: number): Promise<{ ok: true; lamports: number } | { ok: false; why: string }> {
   if (await ticketUsed(sig)) return { ok: false, why: "used" };
   const p = await paidOf(sig);
   if (p === undefined) return { ok: false, why: "busy" };
@@ -154,15 +166,53 @@ export async function ticketsOf(wallet: string, min: number): Promise<{ sig: str
 /** Pays a cash out from the vault to a wallet. Returns the signature, or null if it could not be sent (logged). */
 export async function payOut(wallet: string, lamports: number, bot = false): Promise<string | null> {
   if (!devnet || lamports <= 0) return null;
+  let sent: string | null = null;
   try {
-    const sig = await send(await initVault(), new PublicKey(wallet), lamports);
+    const sig = await send(await initVault(), new PublicKey(wallet), lamports, undefined, (s) => { sent = s; });
     gameOut(lamports);
     vaultBal.at = 0;
     void ledger(bot ? "bot_payout" : "payout", wallet, lamports, sig);
     return sig;
   } catch (e: any) {
-    log("cash_payout_failed", { wallet, lamports, error: String(e?.message ?? e).slice(0, 160) });
+    log("cash_payout_failed", { wallet, lamports, sent, error: String(e?.message ?? e).slice(0, 160) });
+    // A payout is never dropped: it goes to a queue that first checks whether the transfer already sent landed (never paying
+    // twice), and only sends again when it is sure the first one did not.
+    if (!bot) retryPayout(wallet, lamports, sent);
     return null;
+  }
+}
+
+/** Payouts that failed (the RPC refused, the network dropped): retried every 30 s, written to the ledger when they land. */
+const payoutQueue: { wallet: string; lamports: number; tries: number; sent: string | null; at: number }[] = [];
+let payoutTimer: ReturnType<typeof setInterval> | null = null;
+function retryPayout(wallet: string, lamports: number, sent: string | null): void {
+  payoutQueue.push({ wallet, lamports, tries: 0, sent, at: Date.now() });
+  payoutTimer ??= setInterval(() => void drainPayouts(), 30_000);
+  payoutTimer.unref?.();
+}
+async function drainPayouts(): Promise<void> {
+  const { connection } = await chain();
+  for (const q of payoutQueue.splice(0)) {
+    try {
+      // The transfer already sent: landed means paid (done); still unknown within 3 minutes means wait (it may still land).
+      if (q.sent) {
+        const st = (await connection.getSignatureStatuses([q.sent], { searchTransactionHistory: true })).value[0];
+        if (st && !st.err && (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized")) {
+          gameOut(q.lamports); vaultBal.at = 0; void ledger("payout", q.wallet, q.lamports, q.sent); continue;
+        }
+        if (!st && Date.now() - q.at < 180_000) { payoutQueue.push(q); continue; }
+        if (st && !st.err) { payoutQueue.push(q); continue; }
+      }
+      q.at = Date.now();
+      const sig = await send(await initVault(), new PublicKey(q.wallet), q.lamports, undefined, (x) => { q.sent = x; });
+      gameOut(q.lamports);
+      vaultBal.at = 0;
+      void ledger("payout", q.wallet, q.lamports, sig);
+    } catch (e: any) {
+      q.tries++;
+      log("cash_payout_retry", { wallet: q.wallet, lamports: q.lamports, tries: q.tries, error: String(e?.message ?? e).slice(0, 120) });
+      payoutQueue.push(q);
+    }
   }
 }
 
